@@ -112,7 +112,9 @@ BenchResult run_bench(const Manifest& manifest, const std::string& weights_path,
                    weights.data("final_norm.weight"));
     if (mode != QuantMode::Fp32) tf.set_weight_mode(mode, 128);
 
-    const PromptSource prompts = load_bench_prompts(prompts_file, n_prompts);
+    // the loop runs warmup + n_prompts prompts: load that many
+    const PromptSource prompts =
+        load_bench_prompts(prompts_file, warmup + n_prompts);
 
     BenchResult result;
     result.mode = quant_mode_name(mode);
@@ -189,7 +191,9 @@ BenchResult run_bench(const Manifest& manifest, const std::string& weights_path,
                     double z = 0.0;
                     for (int i = 0; i < manifest.vocab; ++i)
                         z += std::exp(static_cast<double>(lg[i] - mx));
-                    nll_sum += -(static_cast<double>(lg[ids[p]]) - mx) - std::log(z);
+                    // NLL = -(lg[t] - mx) + log(z)  (log-sum-exp trapezoid)
+                    nll_sum += -(static_cast<double>(lg[ids[p]]) - mx) +
+                               std::log(z);
                     ++predicted;
                     // feed the token and advance the cache
                     tf.logits_last(std::vector<int>{ids[p]}, tf.cache_len());

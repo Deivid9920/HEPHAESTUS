@@ -38,3 +38,18 @@ add_executable(test_kernels
 )
 target_include_directories(test_kernels PRIVATE src)
 add_test(NAME kernel_parity COMMAND test_kernels)
+
+add_executable(test_kv
+  tests/cpp/test_kv_int8.cpp
+  src/core/tensor.cpp
+  src/core/sha256.cpp
+  src/core/json.cpp
+  src/loader/loader.cpp
+  src/kernels/kernels.cpp
+  src/model/transformer.cpp
+  src/kv/kv_cache.cpp
+  src/quant/quantize.cpp
+)
+target_include_directories(test_kv PRIVATE src)
+add_test(NAME kv_int8_paged COMMAND test_kv
+         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})

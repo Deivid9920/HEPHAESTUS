@@ -59,6 +59,7 @@ PagedInt8KvCache::PagedInt8KvCache(int n_layers, int n_kv_head, int d_head,
     : n_layers_(n_layers),
       n_kv_head_(n_kv_head),
       d_head_(d_head),
+      max_pages_(max_pages),
       k_pool_(static_cast<size_t>(n_layers) * n_kv_head * max_pages *
               kPageTokens * d_head),
       v_pool_(static_cast<size_t>(n_layers) * n_kv_head * max_pages *
@@ -67,8 +68,7 @@ PagedInt8KvCache::PagedInt8KvCache(int n_layers, int n_kv_head, int d_head,
                kPageTokens, 0.0f),
       v_scale_(static_cast<size_t>(n_layers) * n_kv_head * max_pages *
                kPageTokens, 0.0f),
-      valid_(static_cast<size_t>(n_layers) * 64, 0),  // per (layer, page)
-      max_pages_(max_pages) {
+      valid_(static_cast<size_t>(n_layers) * 64, 0) {  // per (layer, page)
     block_table_.reserve(max_pages);
 }
 
