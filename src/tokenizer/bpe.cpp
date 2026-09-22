@@ -19,6 +19,8 @@
 
 #include "tokenizer/bpe.h"
 
+#include <sstream>
+
 #include <algorithm>
 #include <fstream>
 #include <stdexcept>

@@ -37,8 +37,14 @@ class Transformer {
 
     void reset_cache();
     void set_kv_mode(KvMode mode);
+    // Progressive weight quantization for the bench modes: packs every
+    // GEMV projection (wq..w_down and the tied head) with the given
+    // mode; norm vectors stay fp32. Each mode is revertible: the fp32
+    // weights remain the source of truth.
+    void set_weight_mode(QuantMode mode, int group);
+    // Number of tokens currently held by the KV caches.
+    int cache_len() const;
 
-  private:
     struct Impl;
     Impl* impl_;
 };

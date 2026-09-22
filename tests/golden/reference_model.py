@@ -81,11 +81,14 @@ class SafetensorsWeights:
             start, end = info["data_offsets"]
             base = 8 + header_len
             raw = np.frombuffer(
-                self._map, dtype="<f4", count=end - start, offset=base + start
+                self._map, dtype="<f4", count=(end - start) // 4, offset=base + start
             )
             self.tensors[name] = raw.reshape(info["shape"])
 
     def close(self) -> None:
+        # drop the views first: closing a mmap with live exported
+        # buffers raises BufferError
+        self.tensors = {}
         self._map.close()
         self._file.close()
 
@@ -123,7 +126,7 @@ def rope_cache(max_seq: int, d_head: int, theta: float) -> tuple[np.ndarray, np.
     inv_freq = 1.0 / (theta ** (np.arange(0, d_head, 2, dtype=np.float32) / d_head))
     positions = np.arange(max_seq, dtype=np.float32)
     angles = np.outer(positions, inv_freq)
-    return angles.cos(), angles.sin()
+    return np.cos(angles), np.sin(angles)
 
 
 def apply_rope(x: np.ndarray, cos: np.ndarray, sin: np.ndarray) -> np.ndarray:
@@ -131,6 +134,9 @@ def apply_rope(x: np.ndarray, cos: np.ndarray, sin: np.ndarray) -> np.ndarray:
     half = x.shape[-1] // 2
     x1 = x[..., :half]
     x2 = x[..., half:]
+    # broadcast the per-position tables over the head axis
+    cos = cos[:, None, :]
+    sin = sin[:, None, :]
     return np.concatenate([x1 * cos - x2 * sin, x1 * sin + x2 * cos], axis=-1)
 
 
@@ -210,9 +216,17 @@ class ReferenceModel:
             v = (h @ self.w.tensors[p + "attn.wv.weight"].T).reshape(seq, m.n_kv_head, m.d_head)
             q = apply_rope(q, cos, sin)
             k = apply_rope(k, cos, sin)
-            kv.append((k, v))
 
-            k_full, v_full = kv[layer]  # this layer's cache: all tokens so far
+            # this layer's cache holds ALL tokens so far: extend (not
+            # overwrite) the previous entry, then read it back
+            if layer < len(kv):
+                prev_k, prev_v = kv[layer]
+                k_full = np.concatenate([prev_k, k], axis=0).astype(np.float32)
+                v_full = np.concatenate([prev_v, v], axis=0).astype(np.float32)
+                kv[layer] = (k_full, v_full)
+            else:
+                k_full, v_full = k, v
+                kv.append((k_full, v_full))
             # head h attends kv-head h // rep (identity for nano: rep == 1)
             k_tiled = np.repeat(k_full, rep, axis=1).transpose(1, 0, 2)  # [H, kv_seq, d]
             v_tiled = np.repeat(v_full, rep, axis=1).transpose(1, 0, 2)

@@ -92,8 +92,13 @@ Manifest load_manifest(const std::string& path) {
         if (line.empty() || line[0] == '#') continue;
         const size_t eq = line.find('=');
         if (eq == std::string::npos) continue;
-        const std::string key = line.substr(0, eq);
+        std::string key = line.substr(0, eq);
         std::string value = line.substr(eq + 1);
+        // trim both sides of the key and the value ("key = value" lines)
+        while (!key.empty() && (key.front() == ' ' || key.front() == '\t'))
+            key.erase(key.begin());
+        while (!key.empty() && (key.back() == ' ' || key.back() == '\t' || key.back() == '\r'))
+            key.pop_back();
         while (!value.empty() && (value.front() == ' ')) value.erase(value.begin());
         while (!value.empty() && (value.back() == ' ' || value.back() == '\r'))
             value.pop_back();

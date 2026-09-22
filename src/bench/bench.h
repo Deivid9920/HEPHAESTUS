@@ -36,7 +36,8 @@ struct PromptSource {
 PromptSource load_bench_prompts(const std::string& path, int n);
 BenchResult run_bench(const Manifest& manifest, const std::string& weights_path,
                       const std::string& tokenizer_dir, QuantMode mode,
-                      int n_prompts, int warmup, int max_new_tokens,
+                      const std::string& prompts_file, int n_prompts,
+                      int warmup, int max_new_tokens,
                       const std::string& holdout_dir);
 void write_bench_json(const std::string& path, const BenchResult& r);
 

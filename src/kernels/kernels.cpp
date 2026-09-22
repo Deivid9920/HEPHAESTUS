@@ -266,10 +266,12 @@ void apply_rope_scalar(float* x, const RopeTables& t, int seq, int pos_offset) {
         for (int j = 0; j < half; ++j) {
             const float c = t.cos[p * row + j];
             const float s = t.sin[p * row + j];
-            const float a = xr[j] * c;          // x1 * cos
-            const float b = xr[half + j] * s;   // x2 * sin
-            xr[j] = a - b;
-            xr[half + j] = a + b;
+            const float x1 = xr[j];
+            const float x2 = xr[half + j];
+            // half-split rotation: [x1*c - x2*s, x1*s + x2*c] — preserves
+            // the pair norm exactly and matches the NumPy oracle
+            xr[j] = x1 * c - x2 * s;
+            xr[half + j] = x1 * s + x2 * c;
         }
     }
 }
@@ -292,16 +294,18 @@ static void apply_rope_avx2(float* x, const RopeTables& t, int seq,
             const __m256 sv = _mm256_loadu_ps(&t.sin[p * row + j]);
             const __m256 a = _mm256_mul_ps(x1, cv);
             const __m256 b = _mm256_mul_ps(x2, sv);
+            const __m256 d = _mm256_mul_ps(x1, sv);
+            const __m256 e = _mm256_mul_ps(x2, cv);
             _mm256_storeu_ps(xr + j, _mm256_sub_ps(a, b));
-            _mm256_storeu_ps(xr + half + j, _mm256_add_ps(a, b));
+            _mm256_storeu_ps(xr + half + j, _mm256_add_ps(d, e));
         }
         for (; j < half; ++j) {
             const float c = t.cos[p * row + j];
             const float s = t.sin[p * row + j];
-            const float a = xr[j] * c;
-            const float b = xr[half + j] * s;
-            xr[j] = a - b;
-            xr[half + j] = a + b;
+            const float x1 = xr[j];
+            const float x2 = xr[half + j];
+            xr[j] = x1 * c - x2 * s;
+            xr[half + j] = x1 * s + x2 * c;
         }
     }
 }

@@ -42,7 +42,7 @@ class BpeTokenizer {
   private:
     std::unordered_map<std::string, int> vocab_;   // unicode-space piece -> id
     std::vector<std::string> id_to_piece_;
-    std::unordered_map<uint64_t, int> merge_rank_; // (left, right) packed -> rank
+    std::unordered_map<std::string, int> merge_rank_; // left\x01right -> rank
     std::vector<int> byte_token_;                  // 256 mapped base tokens
     int bos_ = -1;
     int eos_ = -1;
