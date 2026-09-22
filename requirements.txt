@@ -1,3 +1,6 @@
+# Python side of HEPHAESTUS: artifact export + golden-test oracle.
+# The C++ engine has ZERO third-party dependencies by design.
+
 numpy>=1.26,<2.1
 pyyaml>=6,<7
 pytest>=8,<9

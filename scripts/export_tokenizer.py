@@ -1,99 +1,87 @@
 #!/usr/bin/env python3
-"""Export the PROMETHEUS-NS tokenizer to the HEPHAESTUS runtime format.
+"""Export the PROMETHEUS-NS tokenizer into engine-side artifacts.
 
-This is the ONLY tokenizer artifact producer. It reads the source
-tokenizer.json (HF tokenizers format, byte-level BPE), extracts the
-vocab, merges and special tokens, verifies that a rebuilt tokenizer
-reproduces the source ids on every sample string (including the golden
-prompts), and writes:
+This is the ONLY tokenizer artifact producer. Run it once after
+`make setup`; it fails loudly if the source is not a byte-level BPE or
+if the rebuilt vocab/merges diverge from the source on the parity
+samples. Outputs (into --out, default artifacts/tokenizer):
+  vocab.json      token string -> id, in the byte->unicode space
+  merges.txt      one merge per line, priority order (rank = line number)
+  specials.json   {bos, eos, pad, unk} ids
+  tokenizer.json  verbatim copy of the source (HF cross-checks read it)
 
-  artifacts/tokenizer/tokenizer.json   verbatim copy (HF oracle side)
-  artifacts/tokenizer/vocab.json       token -> id (unicode space)
-  artifacts/tokenizer/merges.txt       ranked merge pairs
-  artifacts/tokenizer/specials.json    {bos, eos, pad, unk}
-
-It fails loudly if the source is not byte-level BPE or if vocab/merges
-parity with the source breaks on any sample.
+Byte-level pitfalls the C++ runtime MUST handle (parity tests enforce):
+vocab keys are in the byte->unicode space ('G\u0300' = U+0120 for byte
+0x20), the regex pre-split MUST run before merges, and encode must NOT
+inject special tokens.
 """
+
+from __future__ import annotations
 
 import argparse
 import json
 import shutil
+import sys
 from pathlib import Path
 
+from tokenizers import Tokenizer, decoders, models, pre_tokenizers
+
 SAMPLE_STRINGS = [
-    "The ancient mariner sails at dawn.",
-    "Space, the final frontier: 42 light-years away!",
-    "E = mc^2 describes mass-energy equivalence.",
-    "naive cafe facade resume",
-    "line one\nline two\ttabbed",
+    "The quick brown fox jumps over the lazy dog.",
+    "La velocidad de la luz es constante en el vacío.",
+    "In 2024, the model processed 3,141 tokens/second.",
+    "el ruido y la señal: una historia sobre datos",
 ]
 
-BPE_MAX_ELEMENT = 100_000_000
 
-
-def load_source(path: Path):
+def load_source(path: Path) -> tuple[dict, dict, dict]:
     data = json.loads(path.read_text(encoding="utf-8"))
-    model = data.get("model", {})
+    model = data["model"]
     if model.get("type") != "BPE":
-        raise SystemExit(
-            f"source tokenizer is {model.get('type')!r}, expected byte-level BPE: "
-            "HEPHAESTUS only reads the PROMETHEUS-NS byte-level BPE"
-        )
-    pre_tokenizer = data.get("pre_tokenizer", {}) or {}
-    if pre_tokenizer.get("type") != "ByteLevel":
-        raise SystemExit(
-            "source pre_tokenizer is not ByteLevel: the C++ runtime mirrors "
-            "the GPT-2 byte-level pipeline only"
-        )
-    return data, model, pre_tokenizer
+        raise SystemExit(f"source model type is {model.get('type')!r}, need BPE")
+    if model.get("byte_fallback"):
+        raise SystemExit("byte_fallback tokenizers are out of contract")
+    pre = data.get("pre_tokenizer") or {}
+    if pre.get("type") != "ByteLevel":
+        raise SystemExit("source must use the ByteLevel pre-tokenizer")
+    return data, model, pre
 
 
 def parse_merges(model: dict) -> list[tuple[str, str]]:
-    merges = model.get("merges", [])
-    parsed = []
-    for entry in merges:
+    merges: list[tuple[str, str]] = []
+    for entry in model["merges"]:
         if isinstance(entry, list):
-            if len(entry) != 2:
-                raise SystemExit(f"unsupported merge entry: {entry!r}")
-            left, right = entry
-            if isinstance(left, list):  # new-style [pair, id] entries
-                left, right = left
-        elif isinstance(entry, str):
-            parts = entry.split(" ")
-            if len(parts) != 2:
-                raise SystemExit(f"unsupported merge entry: {entry!r}")
-            left, right = parts
+            merges.append((entry[0], entry[1]))
         else:
-            raise SystemExit(f"unsupported merge entry: {entry!r}")
-        parsed.append((left, right))
-    return parsed
+            left, right = entry.split(" ", 1)
+            merges.append((left, right))
+    return merges
 
 
-def extract_specials(data: dict) -> dict:
+def extract_specials(data: dict) -> dict[str, int]:
+    by_content = {t["content"]: int(t["id"]) for t in data.get("added_tokens", [])}
+    lookup = {
+        "bos": ("<|bos|>", "<s>"),
+        "eos": ("<|eos|>", "</s>"),
+        "pad": ("<|pad|>", "<pad>"),
+        "unk": ("<|unk|>", "<unk>"),
+    }
     specials: dict[str, int] = {}
-    added = data.get("added_tokens", []) or []
-    for tok in added:
-        content = tok.get("content", "")
-        for name in ("bos", "eos", "pad", "unk"):
-            marker = f"<|{name}|>"
-            if content == marker:
-                specials[name] = tok["id"]
-    vocab = data.get("model", {}).get("vocab", {})
-    for name in ("bos", "eos", "pad", "unk"):
-        marker = f"<|{name}|>"
-        if name not in specials and marker in vocab:
-            specials[name] = vocab[marker]
-    missing = [n for n in ("bos", "eos", "pad", "unk") if n not in specials]
+    missing = []
+    for name, candidates in lookup.items():
+        for cand in candidates:
+            if cand in by_content:
+                specials[name] = by_content[cand]
+                break
+        else:
+            missing.append(name)
     if missing:
         raise SystemExit(f"source tokenizer lacks special tokens: {missing}")
     return specials
 
 
-def rebuild_tokenizer(model: dict, pre_tokenizer: dict, vocab: dict,
-                      merges: list[tuple[str, str]]):
-    from tokenizers import Tokenizer, decoders, models, pre_tokenizers
-
+def rebuild_tokenizer(model: dict, pre_tokenizer: dict,
+                      vocab: dict[str, int], merges: list[tuple[str, str]]):
     bpe = models.BPE(
         vocab=vocab,
         merges=merges,
@@ -125,8 +113,6 @@ def main() -> None:
     vocab: dict[str, int] = model["vocab"]
     merges = parse_merges(model)
     specials = extract_specials(data)
-
-    from tokenizers import Tokenizer
 
     original = Tokenizer.from_file(str(source_path))
     rebuilt = rebuild_tokenizer(model, pre_tokenizer, vocab, merges)
@@ -166,7 +152,7 @@ def main() -> None:
     print(f"parity sample: {len(SAMPLE_STRINGS)} strings OK")
     print("byte-level pitfalls for the C++ runtime (documented in "
           "tests/golden/test_tokenize_parity.py): vocab keys are in the "
-          "byte->unicode space ('Ġ'=space), the regex pre-split MUST run "
+          "byte->unicode space ('\u0120'=space), the regex pre-split MUST run "
           "before merges, and encode must NOT inject special tokens.")
 
 

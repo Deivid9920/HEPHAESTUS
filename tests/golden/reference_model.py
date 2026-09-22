@@ -1,240 +1,187 @@
 """Pure-NumPy reference implementation of the PROMETHEUS-NS nano decoder.
 
-This module IS the numerical specification for the HEPHAESTUS C++
-engine: the engine must reproduce its greedy continuations exactly and
-its fp32 logits within the tolerances fixed in config.yaml
-(golden.max_abs_diff, golden.cosine_min). Never edit this file to make
-the engine pass; a divergence means the engine is wrong.
+This file IS the numerical specification for HEPHAESTUS: the C++ engine
+must reproduce its greedy continuations EXACTLY and its logits within
+the config tolerances. Never edit the oracle to make the engine pass.
 
-Semantics mirrored from the PROMETHEUS-NS model (prometheus_ns.model):
+Conventions mirrored from PROMETHEUS-NS (prometheus_ns/model/blocks.py):
+  - RMSNorm without mean subtraction: x * rsqrt(mean(x^2) + eps) * weight
+  - RoPE half-split: the first half of each head rotates against the
+    second half; tables are [max_seq, d_head/2].
+  - SwiGLU: w_down(silu(w_gate(x)) * w_up(x))
+  - Pre-norm residual blocks; final norm; tied lm_head (embedding.T).
 
-  - pre-norm blocks: x + attn(rms_norm(x)); x + ffn(rms_norm(x))
-  - RMSNorm without mean subtraction: x * rsqrt(mean(x^2) + eps) * w
-  - SwiGLU: down(silu(gate(x)) * up(x)), all projections stored as
-    row-major [out, in] matrices applied as x @ W.T
-  - RoPE half-split convention with tables [max_seq, d_head/2],
-    inv_freq = 1 / theta^(2i/d_head)
-  - causal attention scaled by 1/sqrt(d_head) over the per-layer cache
-    (past + current); head h attends kv-head h // (n_head // n_kv_head)
-    (identity for nano, where n_head == n_kv_head)
-  - tied embeddings: lm_head.weight == embedding.weight, applied as
-    logits = final_norm(x_last) @ embedding.T
-
-GQA contract note: with n_kv_head < n_head the kv expansion used here
-must change together with the engine's repeat_kv (documented in
-src/model/transformer.h). The nano engine never takes that path.
+GQA note (handoff warning): with the nano profile n_head == n_kv_head,
+so the per-kv-head einsum is direct. When migrating to architectures
+with real GQA (n_kv_head < n_head), this oracle and the engine must
+update the repeat_kv expansion at the same time — the pairing is
+documented in the src/model/transformer.h contract.
 """
 
 from __future__ import annotations
 
+import ast
 import json
-import mmap
-import re
+import math
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
-import yaml
 
-# nano architecture contract (src/model/model_def.h); the manifest must
-# agree with every value here or the oracle refuses to load.
-NANO = {
-    "n_layer": 6,
-    "n_head": 6,
-    "n_kv_head": 6,
-    "d_model": 384,
-    "d_ff": 1024,
-    "max_seq": 256,
-    "vocab": 8000,
-}
+REPO = Path(__file__).resolve().parents[2]
+
+
+def rope_cache(max_seq: int, d_head: int, theta: float
+               ) -> tuple[np.ndarray, np.ndarray]:
+    inv_freq = 1.0 / (theta ** (np.arange(0, d_head, 2, dtype=np.float32)
+                                / np.float32(d_head)))
+    positions = np.arange(max_seq, dtype=np.float32)
+    angles = np.outer(positions, inv_freq)
+    return angles.cos().astype(np.float32), angles.sin().astype(np.float32)
+
+
+def apply_rope(x: np.ndarray, cos: np.ndarray, sin: np.ndarray) -> np.ndarray:
+    """x: [seq, heads, d_head]; cos/sin: [seq, d_head/2] (half-split)."""
+    half = x.shape[-1] // 2
+    x1, x2 = x[..., :half], x[..., half:]
+    return np.concatenate([x1 * cos - x2 * sin, x1 * sin + x2 * cos],
+                          axis=-1).astype(np.float32)
+
+
+def rms_norm(x: np.ndarray, weight: np.ndarray, eps: float) -> np.ndarray:
+    norm = np.mean(x.astype(np.float32) ** 2, axis=-1, keepdims=True)
+    return (x * (1.0 / np.sqrt(norm + eps)) * weight).astype(np.float32)
+
+
+def silu(x: np.ndarray) -> np.ndarray:
+    return (x / (1.0 + np.exp(-x))).astype(np.float32)
+
+
+def softmax(x: np.ndarray) -> np.ndarray:
+    e = np.exp(x - np.max(x, axis=-1, keepdims=True))
+    return (e / np.sum(e, axis=-1, keepdims=True)).astype(np.float32)
 
 
 @dataclass
-class ModelConfig:
+class ModelMeta:
+    d_model: int
     n_layer: int
     n_head: int
     n_kv_head: int
-    d_model: int
-    d_ff: int
-    max_seq: int
-    vocab: int
     d_head: int
+    d_ff: int
+    vocab: int
+    max_seq: int
     rms_norm_eps: float
     rope_theta: float
 
 
-class SafetensorsWeights:
-    """Read-only NumPy view over a fp32 safetensors file."""
+class TensorStore:
+    """Read-only view over the exported safetensors file (fp32)."""
 
-    def __init__(self, path: Path) -> None:
-        self._path = path
-        self._file = open(path, "rb")
-        self._map = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
-        (header_len,) = struct.unpack("<Q", self._map[:8])
-        header = json.loads(self._map[8:8 + header_len])
+    def __init__(self, weights_path: Path) -> None:
+        self._path = Path(weights_path)
+        raw = self._path.read_bytes()
+        (header_len,) = struct.unpack("<Q", raw[:8])
+        header = json.loads(raw[8:8 + header_len])
+        base = 8 + header_len
         self.tensors: dict[str, np.ndarray] = {}
         for name, info in header.items():
             if name == "__metadata__":
                 continue
-            assert info["dtype"] == "F32", f"{name}: expected F32"
             start, end = info["data_offsets"]
-            base = 8 + header_len
-            raw = np.frombuffer(
-                self._map, dtype="<f4", count=end - start, offset=base + start
-            )
-            self.tensors[name] = raw.reshape(info["shape"])
+            shape = tuple(int(s) for s in info["shape"])
+            arr = np.frombuffer(raw, dtype="<f4", count=end - start,
+                                offset=base + start).reshape(shape)
+            self.tensors[name] = arr
 
     def close(self) -> None:
-        self._map.close()
-        self._file.close()
+        self.tensors = {}
 
 
-def load_manifest(path: Path) -> dict:
-    manifest: dict = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if not line.strip() or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        manifest[key.strip()] = value.strip()
-    arch = manifest["arch"]
-    inner = dict(re.findall(r"'(\w+)':\s*([^,}]+)", arch))
-    arch_dict = {
-        key: (int(value) if key != "d_head" else (None if value == "None" else int(value)))
-        for key, value in inner.items()
-    }
-    arch_dict["d_head"] = arch_dict["d_head"] or arch_dict["d_model"] // arch_dict["n_head"]
-    return {
-        "arch": arch_dict,
-        "rms_norm_eps": float(manifest["rms_norm_eps"]),
-        "rope_theta": float(manifest["rope_theta"]),
-    }
-
-
-def oracle_from_cfg(cfg: dict) -> tuple["ReferenceModel", SafetensorsWeights]:
-    repo = Path(__file__).resolve().parents[2]
-    manifest = load_manifest(repo / cfg["paths"]["model_manifest"])
-    weights = SafetensorsWeights(repo / cfg["paths"]["weights"])
-    model = ReferenceModel(manifest, weights)
-    return model, weights
-
-
-def rope_cache(max_seq: int, d_head: int, theta: float) -> tuple[np.ndarray, np.ndarray]:
-    inv_freq = 1.0 / (theta ** (np.arange(0, d_head, 2, dtype=np.float32) / d_head))
-    positions = np.arange(max_seq, dtype=np.float32)
-    angles = np.outer(positions, inv_freq)
-    return angles.cos(), angles.sin()
-
-
-def apply_rope(x: np.ndarray, cos: np.ndarray, sin: np.ndarray) -> np.ndarray:
-    """Rotate ``x`` of shape [seq, n_head, d_head]; cos/sin are [seq, d_head/2]."""
-    half = x.shape[-1] // 2
-    x1 = x[..., :half]
-    x2 = x[..., half:]
-    return np.concatenate([x1 * cos - x2 * sin, x1 * sin + x2 * cos], axis=-1)
-
-
-def rms_norm(x: np.ndarray, weight: np.ndarray, eps: float) -> np.ndarray:
-    norm = np.sqrt((x.astype(np.float32) ** 2).mean(axis=-1, keepdims=True) + eps)
-    return x / norm * weight
-
-
-def silu(x: np.ndarray) -> np.ndarray:
-    return x / (1.0 + np.exp(-x))
-
-
-def softmax(x: np.ndarray) -> np.ndarray:
-    shifted = x - x.max(axis=-1, keepdims=True)
-    e = np.exp(shifted)
-    return e / e.sum(axis=-1, keepdims=True)
-
-
+@dataclass
 class ReferenceModel:
-    """NumPy oracle over the exported safetensors weights."""
+    m: ModelMeta
+    w: TensorStore
+    _rope: tuple = field(default=None, repr=False)
 
-    def __init__(self, manifest: dict, weights: SafetensorsWeights) -> None:
-        arch = manifest["arch"]
-        for key, expected in NANO.items():
-            actual = arch[key]
-            if actual != expected:
-                raise SystemExit(
-                    f"manifest {key}={actual} disagrees with the nano contract "
-                    f"({expected}): the engine only supports the nano architecture"
-                )
-        self.m = ModelConfig(
-            n_layer=arch["n_layer"],
-            n_head=arch["n_head"],
-            n_kv_head=arch["n_kv_head"],
-            d_model=arch["d_model"],
-            d_ff=arch["d_ff"],
-            max_seq=arch["max_seq"],
-            vocab=arch["vocab"],
-            d_head=arch["d_head"],
-            rms_norm_eps=manifest["rms_norm_eps"],
-            rope_theta=manifest["rope_theta"],
-        )
-        self.w = weights
+    def __post_init__(self) -> None:
+        self._rope = rope_cache(self.m.max_seq, self.m.d_head,
+                                self.m.rope_theta)
 
-    def logits(
-        self,
-        tokens: list[int],
-        pos_offset: int = 0,
-        kv: list[tuple[np.ndarray, np.ndarray]] | None = None,
-    ) -> tuple[np.ndarray, list[tuple[np.ndarray, np.ndarray]]]:
-        """Forward ``tokens`` starting at absolute position ``pos_offset``.
-
-        ``kv`` carries one (k, v) pair per layer holding the cache of all
-        tokens so far (past + current chunk, appended by each layer).
-        Returns the logits of the LAST position only, shape [vocab].
-        """
+    def logits(self,
+               tokens: list[int],
+               pos_offset: int = 0,
+               kv: list[tuple[np.ndarray, np.ndarray]] | None = None
+               ) -> tuple[np.ndarray, list[tuple[np.ndarray, np.ndarray]]]:
+        """Full forward for `tokens` starting at absolute position
+        pos_offset. kv is the layer cache list updated in place-style
+        (returned). Returns logits of the LAST position only, shape
+        [vocab]."""
         m = self.m
         x = self.w.tensors["embedding.weight"][tokens].astype(np.float32)
         seq = len(tokens)
-        cos, sin = rope_cache(m.max_seq, m.d_head, m.rope_theta)
-        cos = cos[pos_offset:pos_offset + seq]
-        sin = sin[pos_offset:pos_offset + seq]
-        if kv is None:
-            kv = []
+        cos, sin = self._rope
+        cos, sin = cos[pos_offset:pos_offset + seq], sin[pos_offset:pos_offset + seq]
 
-        # causal mask over the columns [0, pos_offset + seq)
-        mask = np.zeros((seq, pos_offset + seq), dtype=np.float32)
+        # causal mask over [seq, pos_offset + seq]
+        mask = np.full((seq, pos_offset + seq), -np.inf, dtype=np.float32)
         for i in range(seq):
+            mask[i, :pos_offset + i + 1] = 0.0
             mask[i, pos_offset + i + 1:] = -np.inf
 
-        rep = m.n_head // m.n_kv_head
+        kv = list(kv) if kv is not None else []
         for layer in range(m.n_layer):
             p = f"layer.{layer}."
-            h = rms_norm(x, self.w.tensors[p + "attn_norm.weight"], m.rms_norm_eps)
-            q = (h @ self.w.tensors[p + "attn.wq.weight"].T).reshape(seq, m.n_head, m.d_head)
-            k = (h @ self.w.tensors[p + "attn.wk.weight"].T).reshape(seq, m.n_kv_head, m.d_head)
-            v = (h @ self.w.tensors[p + "attn.wv.weight"].T).reshape(seq, m.n_kv_head, m.d_head)
+            h = rms_norm(x, self.w.tensors[p + "attn_norm.weight"],
+                         self.m.rms_norm_eps)
+            q = (h @ self.w.tensors[p + "attn.wq.weight"].T).reshape(
+                seq, m.n_head, m.d_head)
+            k = (h @ self.w.tensors[p + "attn.wk.weight"].T).reshape(
+                seq, m.n_kv_head, m.d_head)
+            v = (h @ self.w.tensors[p + "attn.wv.weight"].T).reshape(
+                seq, m.n_kv_head, m.d_head)
             q = apply_rope(q, cos, sin)
             k = apply_rope(k, cos, sin)
-            kv.append((k, v))
 
-            k_full, v_full = kv[layer]  # this layer's cache: all tokens so far
-            # head h attends kv-head h // rep (identity for nano: rep == 1)
-            k_tiled = np.repeat(k_full, rep, axis=1).transpose(1, 0, 2)  # [H, kv_seq, d]
-            v_tiled = np.repeat(v_full, rep, axis=1).transpose(1, 0, 2)
-            scores = np.einsum("qhd,hkd->hqk", q, k_tiled) / np.sqrt(m.d_head)
+            # this layer's cache: all tokens so far (read + extend)
+            if layer < len(kv):
+                prev_k, prev_v = kv[layer]
+                k_full = np.concatenate([prev_k, k], axis=0).astype(np.float32)
+                v_full = np.concatenate([prev_v, v], axis=0).astype(np.float32)
+            else:
+                k_full, v_full = k, v
+            if layer < len(kv):
+                kv[layer] = (k_full, v_full)
+            else:
+                kv.append((k_full, v_full))
+
+            # attention per kv-head; GQA maps n_head//n_kv_head q-heads
+            # per kv-head (repeat_kv — see module docstring).
+            rep = m.n_head // m.n_kv_head
+            k_rep = np.repeat(k_full, rep, axis=1) if rep > 1 else k_full
+            v_rep = np.repeat(v_full, rep, axis=1) if rep > 1 else v_full
+            scores = np.einsum("qhd,khd->hqk", q, k_rep) / np.sqrt(m.d_head)
             scores = scores + mask[None, :, :]
             probs = softmax(scores)
-            attn_out = np.einsum("hqk,hkd->qhd", probs, v_tiled)
+            attn_out = np.einsum("hqk,khd->qhd", probs, v_rep)
             attn_out = attn_out.reshape(seq, m.n_head * m.d_head)
             x = x + attn_out @ self.w.tensors[p + "attn.wo.weight"].T
 
-            h2 = rms_norm(x, self.w.tensors[p + "ffn_norm.weight"], m.rms_norm_eps)
+            h2 = rms_norm(x, self.w.tensors[p + "ffn_norm.weight"],
+                          self.m.rms_norm_eps)
             gate = silu(h2 @ self.w.tensors[p + "ffn.w_gate.weight"].T)
             up = h2 @ self.w.tensors[p + "ffn.w_up.weight"].T
             x = x + (gate * up) @ self.w.tensors[p + "ffn.w_down.weight"].T
 
-        x_last = rms_norm(x[-1:], self.w.tensors["final_norm.weight"], m.rms_norm_eps)
+        x_last = rms_norm(x[-1:], self.w.tensors["final_norm.weight"],
+                          self.m.rms_norm_eps)
         logits = x_last @ self.w.tensors["embedding.weight"].T
         return logits[0], kv
 
-    def greedy(
-        self, prompt_tokens: list[int], n_new: int, eos_id: int | None = None
-    ) -> list[int]:
+    def greedy(self, prompt_tokens: list[int], n_new: int,
+               eos_id: int | None = None) -> list[int]:
         out: list[int] = []
         kv: list[tuple[np.ndarray, np.ndarray]] = []
         tokens = list(prompt_tokens)
@@ -247,3 +194,33 @@ class ReferenceModel:
             logits, kv = self.logits([nxt], pos_offset=len(tokens), kv=kv)
             tokens.append(nxt)
         return out
+
+
+def parse_manifest(path: Path) -> dict:
+    manifest: dict = {}
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        if not line.strip() or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        manifest[key.strip()] = value.strip()
+    return manifest
+
+
+def oracle_from_cfg(cfg: dict) -> tuple[ReferenceModel, TensorStore]:
+    """Build the oracle from config.yaml paths (manifest + weights)."""
+    manifest = parse_manifest(REPO / cfg["paths"]["model_manifest"])
+    arch = ast.literal_eval(manifest["arch"])
+    meta = ModelMeta(
+        d_model=int(arch["d_model"]),
+        n_layer=int(arch["n_layer"]),
+        n_head=int(arch["n_head"]),
+        n_kv_head=int(arch["n_kv_head"]),
+        d_head=int(manifest.get("d_head", arch.get("d_head"))),
+        d_ff=int(arch["d_ff"]),
+        vocab=int(arch["vocab"]),
+        max_seq=int(arch["max_seq"]),
+        rms_norm_eps=float(manifest["rms_norm_eps"]),
+        rope_theta=float(manifest["rope_theta"]),
+    )
+    store = TensorStore(REPO / cfg["paths"]["weights"])
+    return ReferenceModel(m=meta, w=store), store

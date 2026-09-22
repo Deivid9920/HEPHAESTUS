@@ -14,7 +14,7 @@ logits within fixed tolerances.
 
 ## Architecture
 
-```
+```mermaid
 flowchart LR
     subgraph Export
         A[PROMETHEUS-NS checkpoint .pt] --> B[export_artifacts.py]
@@ -34,10 +34,10 @@ flowchart LR
 
 ## Repository layout
 
-```
+```text
 src/
   model_def.h        canonical tensor names + arch contract (anchor)
-  core/              tensor type, sha256, minimal json
+  core/              minimal tensor type (row-major, fp32) + JSON reader
   loader/            safetensors memory map + manifest/tensors.tsv parsing
   kernels/           GEMV, RMSNorm, SwiGLU, RoPE: scalar reference + SIMD
   model/             forward pass, forward-dump, greedy generation
@@ -57,14 +57,13 @@ scripts/             export, mapping, bench rendering
 make setup
 # point config.yaml -> paths.checkpoint at the PROMETHEUS-NS nano .pt, then:
 make export
-python3 scripts/export_tokenizer.py --source <prometheus-ns>/artifacts/tokenizer/tokenizer.json
 make test
 ```
 
 ## Usage targets
 
 | Target | Purpose |
-|--------|---------|
+|---|---|
 | `make export` | checkpoint -> safetensors + manifest + tokenizer artifacts |
 | `make golden` | engine vs NumPy oracle (logits tolerance + exact greedy match) |
 | `make quantize MODE=int4` | write quantized weight artifacts |
@@ -78,7 +77,7 @@ Every number below must come from an executed run (`docs/bench_*.json`);
 none may be estimated.
 
 | Metric | fp32 | int8 | int4 | ternary |
-|--------|------|------|------|---------|
+|---|---|---|---|---|
 | decode tokens/s (batch 1) | pending | pending | pending | pending |
 | perplexity (PROMETHEUS holdout) | pending | pending | pending | pending |
 | peak RSS (MB) | pending | pending | pending | pending |
@@ -92,5 +91,3 @@ none may be estimated.
   expected to degrade substantially. That degradation is a primary finding
   of this project and must be reported as measured, never hidden.
 - The C++ BPE runtime is a reader, not a trainer; artifacts come from HF.
-- POSIX-only build (getrusage, sys/resource.h, GCC flags): compile and run
-  on Linux or WSL2, as for PROMETHEUS-NS.

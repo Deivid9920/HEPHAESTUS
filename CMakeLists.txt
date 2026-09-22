@@ -11,7 +11,7 @@ endif()
 
 # POSIX-only build: getrusage/sys/resource.h and GCC/Clang flags.
 # Run on Linux or WSL2 (see README limits).
-add_compile_options(-O3 -march=native -Wall -Wextra)
+add_compile_options(-O3 -march=native -Wall -Wextra -ffp-contract=off)
 
 add_executable(heph
   src/main.cpp
