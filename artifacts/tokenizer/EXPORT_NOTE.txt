@@ -1,0 +1,1 @@
+Tokenizer artifacts are NOT produced here. Re-export them from the PROMETHEUS-NS training tokenizer once: tokenizers.Tokenizer.from_file/pickle -> save(vocab.json, merges.txt) into artifacts/tokenizer/, plus specials.json {bos,eos,pad,unk}. The C++ BPE runtime and the NumPy oracle both read these files.

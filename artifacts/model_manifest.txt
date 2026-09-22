@@ -1,0 +1,7 @@
+arch = {'n_layer': 6, 'n_head': 6, 'n_kv_head': 6, 'd_model': 384, 'd_ff': 1024, 'max_seq': 256, 'vocab': 8000, 'd_head': None}
+rms_norm_eps = 1e-05
+rope_theta = 10000.0
+weights_sha256 = 0d9663a43b6a92de6a6e924c3adedff60eaa793fa3fdbdca2366812a8cbfdaac
+weights_file = nano_fp32.safetensors
+tensors_file = tensors.tsv
+d_head = None
