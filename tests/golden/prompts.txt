@@ -1,0 +1,14 @@
+# Golden prompts: one per line, blank lines and #-comments ignored.
+# Chosen so the greedy argmax gaps stay far above fp32 accumulation noise
+# and the tokenized lengths fall in the 64-256 window used by the logits
+# tolerance test.
+
+The ancient philosopher walked through the marble courtyard at dawn, pondering the nature of knowledge and the limits of human understanding, while the city slowly awakened beneath him and merchants prepared their stalls for the morning market.
+
+In the depth of winter, the researchers catalogued every specimen collected during the expedition, comparing the morphological details of each sample against the historical records preserved in the university archives since the previous century.
+
+The signal processing pipeline converts raw measurements into meaningful features: first the data is filtered to remove noise, then normalized to a common scale, and finally projected onto a lower dimensional space for efficient storage and retrieval.
+
+Long before the printing press transformed Europe, scribes in dim monasteries copied manuscripts by candlelight, preserving the works of antiquity through generations of patient labour, and their careful hands guarded knowledge that would otherwise have vanished forever.
+
+Every mathematical proof begins with a set of assumptions that must be stated clearly: from those axioms, the argument proceeds step by step, each deduction following from the ones before it, until the theorem stands established beyond reasonable doubt.

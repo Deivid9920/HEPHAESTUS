@@ -1,0 +1,13 @@
+build/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Derived heavy artifacts: regenerate with `make export` / `make quantize`
+artifacts/*.safetensors
+artifacts/quant/
+tests/golden/fixtures/
+
+# Benchmark outputs are regenerated; committed only when publishing
+docs/bench_*.json

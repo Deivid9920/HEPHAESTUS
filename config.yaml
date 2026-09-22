@@ -1,0 +1,39 @@
+# HEPHAESTUS configuration. Python-side scripts (export, golden tests)
+# read this file; the C++ engine receives everything via CLI flags whose
+# contracts are fixed in the Makefile. Structure enforced by
+# tests/test_structure.py.
+
+paths:
+  # Artifacts produced by `make export` from a PROMETHEUS-NS checkpoint.
+  model_manifest: "artifacts/model_manifest.txt"
+  tensors_table:  "artifacts/tensors.tsv"
+  weights:        "artifacts/nano_fp32.safetensors"
+  tokenizer_dir:  "artifacts/tokenizer"    # vocab.json + merges.txt
+  checkpoint:     ""                       # path to PROMETHEUS-NS .pt (set before export)
+
+arch_defaults:
+  rms_norm_eps: 1.0e-5
+  rope_theta: 10000.0
+  d_head: null        # null = d_model / n_head (computed)
+
+golden:
+  prompts_file: "tests/golden/prompts.txt"
+  fixtures_dir: "tests/golden/fixtures"
+  tokens_per_prompt: 64
+  max_abs_diff: 1.0e-2
+  cosine_min: 0.999
+
+quant:
+  int4_group: 128
+  ternary_scale: mean_abs      # scale = mean(|w|) per tensor
+  int8_axis: out_channel       # per output channel, symmetric
+
+kv:
+  page_tokens: 16
+  quant: int8                  # per head, per token scale
+
+bench:
+  prompts: 50
+  warmup: 5
+  max_new_tokens: 128
+  modes: [fp32, int8, int4, ternary]

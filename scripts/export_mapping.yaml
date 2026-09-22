@@ -1,0 +1,32 @@
+# Key-mapping rules from the PROMETHEUS-NS checkpoint state_dict to the
+# canonical engine tensor names in src/model/model_def.h.
+#
+# Contract (enforced by scripts/export_artifacts.py):
+#   - Each rule: {pattern: <regex over the source key>, target: <template
+#     using {i} for the layer index}>. First matching rule wins; rules are
+#     applied in order.
+#   - The export FAILS LOUDLY listing every unmapped key. Edit the rules
+#     until coverage is exactly 100% of the checkpoint keys (plus the
+#     explicitly listed ignores), then commit the corrected file.
+#   - Validation: the target set must equal the canonical name set for
+#     the manifest's n_layer; duplicates or collisions are errors.
+
+ignore_patterns:
+  - "^pos_embed"          # not present in this architecture; listed defensively
+  - "rope"                # RoPE is computed, not stored
+  - "inv_freq"
+  - "mask_cache"
+
+rules:
+  - {pattern: "^embed(ding|_tokens|\\.token_embedding)?\\.weight$",       target: "embedding.weight"}
+  - {pattern: "^layers?\\.(\\d+)\\.attn_norm\\.weight$",                  target: "layer.{i}.attn_norm.weight"}
+  - {pattern: "^layers?\\.(\\d+)\\.(attn|attention)\\.(wq|q_proj)\\.weight$", target: "layer.{i}.attn.wq.weight"}
+  - {pattern: "^layers?\\.(\\d+)\\.(attn|attention)\\.(wk|k_proj)\\.weight$", target: "layer.{i}.attn.wk.weight"}
+  - {pattern: "^layers?\\.(\\d+)\\.(attn|attention)\\.(wv|v_proj)\\.weight$", target: "layer.{i}.attn.wv.weight"}
+  - {pattern: "^layers?\\.(\\d+)\\.(attn|attention)\\.(wo|o_proj)\\.weight$", target: "layer.{i}.attn.wo.weight"}
+  - {pattern: "^layers?\\.(\\d+)\\.ffn_norm\\.weight$",                   target: "layer.{i}.ffn_norm.weight"}
+  - {pattern: "^layers?\\.(\\d+)\\.(ffn|mlp)\\.(w_gate|gate_proj)\\.weight$", target: "layer.{i}.ffn.w_gate.weight"}
+  - {pattern: "^layers?\\.(\\d+)\\.(ffn|mlp)\\.(w_up|up_proj)\\.weight$", target: "layer.{i}.ffn.w_up.weight"}
+  - {pattern: "^layers?\\.(\\d+)\\.(ffn|mlp)\\.(w_down|down_proj)\\.weight$", target: "layer.{i}.ffn.w_down.weight"}
+  - {pattern: "^(final_norm|norm)\\.weight$",                             target: "final_norm.weight"}
+  - {pattern: "^lm_head\\.weight$",                                       target: "lm_head.weight"}  # tied: verified equal to embedding, not exported
