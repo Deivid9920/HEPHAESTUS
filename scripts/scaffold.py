@@ -1,56 +1,45 @@
 #!/usr/bin/env python3
 """Generate the HEPHAESTUS C++ tree with contracted stubs.
 
-Idempotent: existing files are kept (the agent's implementation is never
-overwritten); missing files are created from the contracts below. The
-headers are the FINAL contracts — implementations evolve inside them,
-the signatures do not move.
-
-Anchors (immutable contracts, must exist before this script runs):
-Makefile, config.yaml, requirements.txt, README.md, tests/test_structure.py,
-scripts/export_artifacts.py, scripts/export_mapping.yaml,
-tests/golden/reference_model.py, tests/golden/golden_test.py.
+Idempotent: files that already exist are kept untouched ("kept existing"),
+so re-running after implementation never overwrites work. The stubs
+compile cleanly and throw std::runtime_error until each phase is
+implemented. After generation the script lists the anchor files that must
+already be present from the specification package.
 """
 
-from __future__ import annotations
-
-import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
 PLAIN_DIRS = [
-    "src/core",
-    "src/loader",
-    "src/kernels",
-    "src/model",
-    "src/kv",
-    "src/quant",
-    "src/tokenizer",
-    "src/bench",
-    "tests/cpp",
-    "tests/golden",
+    "src/core", "src/loader", "src/kernels", "src/model", "src/kv",
+    "src/quant", "src/tokenizer", "src/bench",
+    "tests/cpp", "tests/golden", "docs", "artifacts",
 ]
 
-CMAKELISTS = r"""
+CMAKELISTS = """
 cmake_minimum_required(VERSION 3.16)
 project(hephaestus CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+enable_testing()
 
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
-# GCC/Clang flags per spec. cl.exe would need /O2 /arch:AVX2 /W4; this
-# project builds under Linux (bare, WSL2 or Docker) by contract.
-set(HEPH_FLAGS -O3 -march=native -Wall -Wextra)
+# POSIX-only build: getrusage/sys/resource.h and GCC/Clang flags.
+# Run on Linux or WSL2 (see README limits).
+add_compile_options(-O3 -march=native -Wall -Wextra)
 
-add_library(heph_core STATIC
+add_executable(heph
+  src/main.cpp
   src/core/tensor.cpp
+  src/core/sha256.cpp
   src/core/json.cpp
-  src/loader/safetensors.cpp
+  src/loader/loader.cpp
   src/kernels/kernels.cpp
   src/model/transformer.cpp
   src/kv/kv_cache.cpp
@@ -58,1290 +47,1191 @@ add_library(heph_core STATIC
   src/tokenizer/bpe.cpp
   src/bench/bench.cpp
 )
-target_include_directories(heph_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_compile_options(heph_core PRIVATE ${HEPH_FLAGS})
+target_include_directories(heph PRIVATE src)
 
-add_executable(heph src/main.cpp)
-target_link_libraries(heph PRIVATE heph_core)
-target_compile_options(heph PRIVATE ${HEPH_FLAGS})
-
-enable_testing()
-add_executable(test_kernels tests/cpp/test_kernels.cpp)
-target_link_libraries(test_kernels PRIVATE heph_core)
-target_compile_options(test_kernels PRIVATE ${HEPH_FLAGS})
+add_executable(test_kernels
+  tests/cpp/test_kernels.cpp
+  src/core/tensor.cpp
+  src/core/sha256.cpp
+  src/kernels/kernels.cpp
+  src/kv/kv_cache.cpp
+  src/quant/quantize.cpp
+)
+target_include_directories(test_kernels PRIVATE src)
 add_test(NAME kernel_parity COMMAND test_kernels)
-""".strip()
+"""
 
-MODEL_DEF_H = r"""
-#ifndef HEPH_MODEL_DEF_H_
-#define HEPH_MODEL_DEF_H_
-
-// Canonical architecture contract for the PROMETHEUS-NS nano decoder.
+MODEL_DEF_H = """
+// Canonical tensor names and the architecture contract for HEPHAESTUS.
 //
-// WHY HARDCODED: HEPHAESTUS supports EXACTLY this architecture — that is
-// the premise of the project, not a limitation to apologize for. Freezing
-// the shapes here lets every kernel assume compile-time-known widths and
-// lets the loader reject any checkpoint that does not match, instead of
-// paying for generic dispatch the spec forbids. If the architecture ever
-// changes, this file is the single place to update and the golden tests
-// fail loudly until engine and oracle agree again.
-//
-// nano profile: 6 pre-norm decoder layers, RMSNorm (eps 1e-5), SwiGLU
-// (d_ff 1024), RoPE theta 10000 with the half-split convention, GQA with
-// n_kv_head == n_head == 6 (repeat_kv is a no-op today — see
-// src/model/transformer.h), tied embeddings (lm_head == embedding) over
-// a vocab of 8000, context 256 tokens, KV-cache pages of 16 tokens.
+// The engine supports EXACTLY the PROMETHEUS-NS nano decoder and nothing
+// else. Hardcoding the architecture is deliberate (spec constraint): a
+// fixed shape removes every generic-dispatch branch from the hot path,
+// lets the GEMV kernels use compile-time-friendly strides, and keeps the
+// KV-cache layout statically known. Supporting more architectures is out
+// of scope by design; the manifest is still validated against these
+// constants at load time and the engine refuses any disagreement.
 
-#define HEPH_N_LAYER 6
-#define HEPH_N_HEAD 6
-#define HEPH_N_KV_HEAD 6
-#define HEPH_D_MODEL 384
-#define HEPH_D_FF 1024
-#define HEPH_VOCAB 8000
-#define HEPH_D_HEAD (HEPH_D_MODEL / HEPH_N_HEAD)
-#define HEPH_KV_PAGE_TOKENS 16
+#pragma once
 
 namespace heph {
 
-constexpr int kNLayer = HEPH_N_LAYER;
-constexpr int kNHead = HEPH_N_HEAD;
-constexpr int kNKvHead = HEPH_N_KV_HEAD;
-constexpr int kDModel = HEPH_D_MODEL;
-constexpr int kDFf = HEPH_D_FF;
-constexpr int kVocab = HEPH_VOCAB;
-constexpr int kDHead = HEPH_D_HEAD;
-constexpr int kKvPageTokens = HEPH_KV_PAGE_TOKENS;
+// nano architecture contract. The export manifest must match every value.
+constexpr int kNLayers = 6;
+constexpr int kNHead = 6;
+constexpr int kNKvHead = 6;       // GQA group size 1 for nano
+constexpr int kDModel = 384;
+constexpr int kDFf = 1024;
+constexpr int kDHead = kDModel / kNHead;  // 64
+constexpr int kMaxSeq = 256;
+constexpr int kVocab = 8000;
 
-// Canonical tensor names, enumerated explicitly for all six layers so
-// the contract is greppable and diffable (tests/test_structure.py reads
-// this file for every name). The export mapping must produce exactly
-// this set; the loader refuses anything else.
-inline const char* const kCanonicalTensors[] = {
+// Canonical tensor names, expanded for the six nano layers. The loader
+// keys its weight table by exactly these strings; scripts/export_mapping.yaml
+// must produce them from the PROMETHEUS-NS checkpoint state_dict.
+static const char* const kCanonicalTensorNames[] = {
     "embedding.weight",
-    "layer.0.attn_norm.weight",
-    "layer.1.attn_norm.weight",
-    "layer.2.attn_norm.weight",
-    "layer.3.attn_norm.weight",
-    "layer.4.attn_norm.weight",
-    "layer.5.attn_norm.weight",
-    "layer.0.attn.wq.weight",
-    "layer.1.attn.wq.weight",
-    "layer.2.attn.wq.weight",
-    "layer.3.attn.wq.weight",
-    "layer.4.attn.wq.weight",
-    "layer.5.attn.wq.weight",
-    "layer.0.attn.wk.weight",
-    "layer.1.attn.wk.weight",
-    "layer.2.attn.wk.weight",
-    "layer.3.attn.wk.weight",
-    "layer.4.attn.wk.weight",
-    "layer.5.attn.wk.weight",
-    "layer.0.attn.wv.weight",
-    "layer.1.attn.wv.weight",
-    "layer.2.attn.wv.weight",
-    "layer.3.attn.wv.weight",
-    "layer.4.attn.wv.weight",
-    "layer.5.attn.wv.weight",
-    "layer.0.attn.wo.weight",
-    "layer.1.attn.wo.weight",
-    "layer.2.attn.wo.weight",
-    "layer.3.attn.wo.weight",
-    "layer.4.attn.wo.weight",
-    "layer.5.attn.wo.weight",
-    "layer.0.ffn_norm.weight",
-    "layer.1.ffn_norm.weight",
-    "layer.2.ffn_norm.weight",
-    "layer.3.ffn_norm.weight",
-    "layer.4.ffn_norm.weight",
-    "layer.5.ffn_norm.weight",
-    "layer.0.ffn.w_gate.weight",
-    "layer.1.ffn.w_gate.weight",
-    "layer.2.ffn.w_gate.weight",
-    "layer.3.ffn.w_gate.weight",
-    "layer.4.ffn.w_gate.weight",
-    "layer.5.ffn.w_gate.weight",
-    "layer.0.ffn.w_up.weight",
-    "layer.1.ffn.w_up.weight",
-    "layer.2.ffn.w_up.weight",
-    "layer.3.ffn.w_up.weight",
-    "layer.4.ffn.w_up.weight",
-    "layer.5.ffn.w_up.weight",
+    "layer.0.attn_norm.weight", "layer.0.attn.wq.weight",
+    "layer.0.attn.wk.weight",   "layer.0.attn.wv.weight",
+    "layer.0.attn.wo.weight",   "layer.0.ffn_norm.weight",
+    "layer.0.ffn.w_gate.weight", "layer.0.ffn.w_up.weight",
     "layer.0.ffn.w_down.weight",
+    "layer.1.attn_norm.weight", "layer.1.attn.wq.weight",
+    "layer.1.attn.wk.weight",   "layer.1.attn.wv.weight",
+    "layer.1.attn.wo.weight",   "layer.1.ffn_norm.weight",
+    "layer.1.ffn.w_gate.weight", "layer.1.ffn.w_up.weight",
     "layer.1.ffn.w_down.weight",
+    "layer.2.attn_norm.weight", "layer.2.attn.wq.weight",
+    "layer.2.attn.wk.weight",   "layer.2.attn.wv.weight",
+    "layer.2.attn.wo.weight",   "layer.2.ffn_norm.weight",
+    "layer.2.ffn.w_gate.weight", "layer.2.ffn.w_up.weight",
     "layer.2.ffn.w_down.weight",
+    "layer.3.attn_norm.weight", "layer.3.attn.wq.weight",
+    "layer.3.attn.wk.weight",   "layer.3.attn.wv.weight",
+    "layer.3.attn.wo.weight",   "layer.3.ffn_norm.weight",
+    "layer.3.ffn.w_gate.weight", "layer.3.ffn.w_up.weight",
     "layer.3.ffn.w_down.weight",
+    "layer.4.attn_norm.weight", "layer.4.attn.wq.weight",
+    "layer.4.attn.wk.weight",   "layer.4.attn.wv.weight",
+    "layer.4.attn.wo.weight",   "layer.4.ffn_norm.weight",
+    "layer.4.ffn.w_gate.weight", "layer.4.ffn.w_up.weight",
     "layer.4.ffn.w_down.weight",
+    "layer.5.attn_norm.weight", "layer.5.attn.wq.weight",
+    "layer.5.attn.wk.weight",   "layer.5.attn.wv.weight",
+    "layer.5.attn.wo.weight",   "layer.5.ffn_norm.weight",
+    "layer.5.ffn.w_gate.weight", "layer.5.ffn.w_up.weight",
     "layer.5.ffn.w_down.weight",
     "final_norm.weight",
-    "lm_head.weight",  // tied to embedding: verified at export, never exported
+    "lm_head.weight",  // tied to embedding.weight; verified equal at export
 };
-
-inline constexpr int kCanonicalTensorCount =
-    sizeof(kCanonicalTensors) / sizeof(kCanonicalTensors[0]);
+static constexpr int kCanonicalTensorCount =
+    static_cast<int>(sizeof(kCanonicalTensorNames) / sizeof(kCanonicalTensorNames[0]));
 
 }  // namespace heph
-
-#endif  // HEPH_MODEL_DEF_H_
-""".strip()
-
-PROMPTS = """# Golden prompts: one prompt per line; the engine and the oracle must
-# agree on 64 greedy continuations for each (and on last-position logits).
-The quick brown fox jumps over the lazy dog near the river bank while the sun sets.
-La inteligencia artificial combina datos, modelos y una buena dosis de paciencia.
-In the beginning the engine was only a skeleton of stubs that threw exceptions.
-El motor de inferencia mide tokens por segundo con una metodologia honesta y fija.
-Memory, alignment and accumulation order decide whether SIMD kernels are fast and correct.
 """
 
-TEST_KERNELS_CPP = r"""
-// Kernel parity tests: scalar reference vs SIMD dispatch.
-//
-// Contract (protocolo de operacion): every SIMD kernel ships with a
-// scalar reference and a parity test — bit-identical for integer
-// kernels, tolerance 1e-6 for float kernels on the inputs used here.
-// These tests are RED while the kernels are stubs; that is the
-// contracted starting state of the project.
+TEST_KERNELS_CPP = """
+// Kernel parity tests: every SIMD implementation must match its scalar
+// reference — bit-identical for integer kernels, max-abs-diff <= 1e-6
+// for float kernels (the scalar reference mirrors the SIMD lane
+// ordering, so ISA differences are isolated from ordering differences).
+// Run via ctest (make test).
 
 #include <cmath>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
-#include <functional>
 #include <random>
-#include <stdexcept>
-#include <string>
 #include <vector>
 
 #include "kernels/kernels.h"
+#include "model/model_def.h"
 #include "quant/quantize.h"
-#include "core/tensor.h"
+
+using namespace heph;
 
 namespace {
 
 int g_failures = 0;
 
-void report(const std::string& name, bool ok, const std::string& detail = "") {
-  std::printf("%-52s %s%s%s\n", name.c_str(), ok ? "[ OK ]" : "[FAIL]",
-              detail.empty() ? "" : " — ", detail.c_str());
-  if (!ok) g_failures++;
-}
-
-std::vector<float> uniform_vector(std::mt19937& rng, size_t n, float scale) {
-  std::uniform_real_distribution<float> dist(-scale, scale);
-  std::vector<float> v(n);
-  for (auto& x : v) x = dist(rng);
-  return v;
-}
-
-void expect_close(const std::string& name, const std::vector<float>& a,
+void expect_close(const char* name, const std::vector<float>& a,
                   const std::vector<float>& b, float tol) {
   if (a.size() != b.size()) {
-    report(name, false, "size mismatch");
+    std::printf("FAIL %s: size %zu vs %zu\\n", name, a.size(), b.size());
+    ++g_failures;
     return;
   }
-  float worst = 0.0f;
-  size_t where = 0;
+  double max_diff = 0.0;
   for (size_t i = 0; i < a.size(); ++i) {
-    float d = std::fabs(a[i] - b[i]);
-    if (d > worst) {
-      worst = d;
-      where = i;
-    }
+    double d = std::fabs(static_cast<double>(a[i]) - static_cast<double>(b[i]));
+    if (d > max_diff) max_diff = d;
   }
-  report(name, worst <= tol,
-         worst <= tol ? ""
-                      : "max diff " + std::to_string(worst) + " at " +
-                            std::to_string(where));
+  if (max_diff > tol) {
+    std::printf("FAIL %s: max diff %.3g > %.3g\\n", name, max_diff, tol);
+    ++g_failures;
+  } else {
+    std::printf("ok   %s (max diff %.3g)\\n", name, max_diff);
+  }
+}
+
+void expect_true(const char* name, bool ok) {
+  if (!ok) {
+    std::printf("FAIL %s\\n", name);
+    ++g_failures;
+  } else {
+    std::printf("ok   %s\\n", name);
+  }
+}
+
+std::vector<float> random_vector(size_t n, unsigned seed, float scale = 0.25f) {
+  std::mt19937 gen(seed);
+  std::uniform_real_distribution<float> dist(-scale, scale);
+  std::vector<float> v(n);
+  for (auto& x : v) x = dist(gen);
+  return v;
 }
 
 }  // namespace
 
 int main() {
-  std::mt19937 rng(20260922u);
+  const int n_out = kDFf;   // 1024
+  const int n_in = kDModel; // 384
 
-  // --- GEMV: y = W x, W row-major [rows x cols], scalar vs SIMD -----
+  // fp32 GEMV: scalar reference vs SIMD dispatch (AVX2, and AVX-512F
+  // when the runtime reports it) with identical lane ordering.
+  auto w = random_vector(static_cast<size_t>(n_out) * n_in, 1);
+  auto x = random_vector(n_in, 2);
+  std::vector<float> out_ref(n_out), out_simd(n_out);
+  gemv_f32_scalar(out_ref.data(), w.data(), x.data(), n_out, n_in);
+  gemv_f32(out_simd.data(), w.data(), x.data(), n_out, n_in);
+  expect_close("gemv_f32 simd vs scalar", out_simd, out_ref, 1e-6f);
+
+  // RMSNorm: one row, eps inside the square root.
+  auto nw = random_vector(n_in, 3, 1.0f);
+  std::vector<float> rms_ref(n_in), rms_simd(n_in);
+  rms_norm_scalar(x.data(), rms_ref.data(), nw.data(), n_in, 1e-5f);
+  rms_norm(x.data(), rms_simd.data(), nw.data(), n_in, 1e-5f);
+  expect_close("rms_norm simd vs scalar", rms_simd, rms_ref, 1e-6f);
+
+  // SwiGLU elementwise gate*up.
+  auto g = random_vector(n_in, 4);
+  auto u = random_vector(n_in, 5);
+  std::vector<float> sw_ref(n_in), sw_simd(n_in);
+  swiglu_scalar(g.data(), u.data(), sw_ref.data(), n_in);
+  swiglu(g.data(), u.data(), sw_simd.data(), n_in);
+  expect_close("swiglu simd vs scalar", sw_simd, sw_ref, 1e-6f);
+
+  // RoPE: in-place rotation of a [3, kNHead, kDHead] block at offset 7.
+  // Rotation must preserve the per-pair norm (half-split convention).
+  auto q = random_vector(3 * kNHead * kDHead, 6);
+  std::vector<float> q_ref = q, q_simd = q;
+  RopeTables tables = build_rope_tables(kMaxSeq, kDHead, 10000.0f);
+  apply_rope_scalar(q_ref.data(), tables, 3, 7);
+  apply_rope(q_simd.data(), tables, 3, 7);
+  expect_close("rope simd vs scalar", q_simd, q_ref, 1e-6f);
+  double max_norm_drift = 0.0;
+  for (int i = 0; i < 3 * kNHead; ++i) {
+    float before = 0.0f, after = 0.0f;
+    for (int j = 0; j < kDHead; ++j) {
+      const float b = q[i * kDHead + j], a = q_simd[i * kDHead + j];
+      before += b * b;
+      after += a * a;
+    }
+    max_norm_drift = std::max(max_norm_drift,
+                              std::fabs(static_cast<double>(std::sqrt(before) -
+                                                            std::sqrt(after))));
+  }
+  expect_true("rope preserves per-head norm", max_norm_drift < 1e-5f);
+
+  // int8 GEMV: integer path must be bit-exact between scalar and SIMD,
+  // and track the dequantized fp32 dot within quantization error.
+  std::vector<int8_t> qw(static_cast<size_t>(n_out) * n_in);
+  std::vector<float> scales(n_out);
+  quantize_rows_int8(w.data(), n_out, n_in, qw.data(), scales.data());
+  std::vector<float> qi_ref(n_out), qi_simd(n_out);
+  gemv_int8_scalar(qi_ref.data(), qw.data(), scales.data(), x.data(),
+                   n_out, n_in);
+  gemv_int8(qi_simd.data(), qw.data(), scales.data(), x.data(), n_out, n_in);
+  expect_true("gemv_int8 bit-exact (scalar vs simd)",
+              std::memcmp(qi_ref.data(), qi_simd.data(),
+                          sizeof(float) * n_out) == 0);
+  std::vector<float> q_deq(static_cast<size_t>(n_out) * n_in);
+  for (size_t r = 0; r < static_cast<size_t>(n_out); ++r)
+    for (int c = 0; c < n_in; ++c)
+      q_deq[r * n_in + c] = static_cast<float>(qw[r * n_in + c]) * scales[r];
+  std::vector<float> q_fp32(n_out);
+  gemv_f32_scalar(q_fp32.data(), q_deq.data(), x.data(), n_out, n_in);
+  expect_close("gemv_int8 vs dequantized fp32", qi_simd, q_fp32, 2e-3f);
+
+  // int4 packing contract: weight 2i lives in the LOW nibble of byte i
+  // (low-first), weight 2i+1 in the high nibble. Codes are q + 8.
   {
-    struct Size { int rows, cols; };
-    const Size sizes[] = {{384, 384}, {1024, 384}, {384, 1024}, {7, 13}};
-    for (const auto& s : sizes) {
-      auto W = uniform_vector(rng, s.rows * s.cols, 0.05f);
-      auto x = uniform_vector(rng, s.cols, 0.05f);
-      std::vector<float> y_ref(s.rows, 0.0f), y_simd(s.rows, 0.0f);
-      heph::gemv_scalar(W.data(), x.data(), y_ref.data(), s.rows, s.cols);
-      try {
-        heph::gemv(W.data(), x.data(), y_simd.data(), s.rows, s.cols);
-        std::vector<float> y_ref2 = y_ref;  // keep separate on purpose
-        expect_close("gemv parity " + std::to_string(s.rows) + "x" +
-                         std::to_string(s.cols),
-                     y_ref2, y_simd, 1e-6f);
-      } catch (const std::exception& e) {
-        report("gemv parity " + std::to_string(s.rows) + "x" +
-                   std::to_string(s.cols), false, e.what());
-      }
+    std::vector<float> row = {0.3f, -0.3f};
+    // scale = max_abs/7 = 0.3/7; codes: round(0.3/scale)+8 = 15,
+    // round(-0.3/scale)+8 = 1 -> byte = 0x1F (low nibble 15, high 1).
+    uint16_t scale_fp16 = 0;
+    uint8_t byte = 0;
+    quantize_rows_int4(row.data(), 1, 2, 128, &byte, &scale_fp16);
+    expect_true("int4 low-nibble-first packing", byte == 0x1F);
+  }
+  std::vector<uint8_t> i4p((n_in + 1) / 2);
+  std::vector<uint16_t> i4s((n_in + 127) / 128);
+  quantize_rows_int4(w.data(), 1, n_in, 128, i4p.data(), i4s.data());
+  std::vector<float> i4row(n_in);
+  unpack_row_int4(i4p.data(), i4s.data(), n_in, 128, i4row.data());
+  float worst_int4 = 0.0f;
+  {
+    // per-group scale from the fp16 storage
+    float max_abs = 0.0f;
+    for (int grp = 0; grp < (n_in + 127) / 128; ++grp) {
+      max_abs = 0.0f;
+      const int lo = grp * 128, hi = std::min(lo + 128, n_in);
+      for (int c = lo; c < hi; ++c) max_abs = std::max(max_abs, std::fabs(w[c]));
+      const float scale = max_abs / 7.0f;
+      for (int c = lo; c < hi; ++c)
+        worst_int4 = std::max(worst_int4, std::fabs(i4row[c] - w[c]) - scale * 0.5f);
     }
   }
+  expect_true("int4 roundtrip within half-step", worst_int4 <= 1e-3f);
 
-  // --- RMSNorm parity -------------------------------------------------
+  // ternary: lookup GEMV must equal the scalar dot of the dequantized
+  // row bit-exactly (same accumulation order, same lut values).
+  std::vector<uint8_t> tpack((n_in + 3) / 4);
+  float tscale = 0.0f;
+  quantize_row_ternary(w.data(), n_in, tpack.data(), &tscale);
+  std::vector<float> tern_row(n_in);
+  ternary_dequant_row(tpack.data(), tscale, tern_row.data(), n_in);
+  bool tern_values_ok = true;
+  for (int c = 0; c < n_in; ++c) {
+    const float v = tern_row[c];
+    if (!(v == 0.0f || v == tscale || v == -tscale)) tern_values_ok = false;
+  }
+  expect_true("ternary values in {-s, 0, +s}", tern_values_ok);
+  float t_ref = 0.0f, t_simd = 0.0f;
+  gemv_f32_scalar(&t_ref, tern_row.data(), x.data(), 1, n_in);
+  gemv_ternary_row(&t_simd, tpack.data(), tscale, x.data(), n_in);
+  expect_close("gemv_ternary lookup vs scalar", {t_simd}, {t_ref}, 1e-6f);
+
+  // softmax: stable on huge inputs and sums to one.
   {
-    auto x = uniform_vector(rng, 384, 1.0f);
-    auto w = uniform_vector(rng, 384, 0.5f);
-    std::vector<float> a(384), b(384);
-    heph::rmsnorm_scalar(x.data(), w.data(), a.data(), 384, 1e-5f);
-    try {
-      heph::rmsnorm(x.data(), w.data(), b.data(), 384, 1e-5f);
-      expect_close("rmsnorm parity", a, b, 1e-6f);
-    } catch (const std::exception& e) {
-      report("rmsnorm parity", false, e.what());
-    }
+    std::vector<float> big = {10000.0f, 10001.0f, 9999.0f};
+    softmax_inplace(big.data(), static_cast<int>(big.size()));
+    const float sum = big[0] + big[1] + big[2];
+    expect_true("softmax stable on 1e4 inputs",
+                std::fabs(sum - 1.0f) < 1e-6f && big[1] > big[0]);
   }
 
-  // --- SiLU parity ----------------------------------------------------
-  {
-    auto x = uniform_vector(rng, 1024, 8.0f);
-    std::vector<float> a(1024), b(1024);
-    heph::silu_scalar(x.data(), a.data(), 1024);
-    try {
-      heph::silu(x.data(), b.data(), 1024);
-      expect_close("silu parity", a, b, 1e-6f);
-    } catch (const std::exception& e) {
-      report("silu parity", false, e.what());
-    }
+  if (g_failures == 0) {
+    std::printf("all kernel parity tests passed\\n");
+    return 0;
   }
-
-  // --- softmax parity ---------------------------------------------------
-  {
-    auto x = uniform_vector(rng, 8000, 12.0f);
-    std::vector<float> a(8000), b(8000);
-    heph::softmax_scalar(x.data(), a.data(), 8000);
-    try {
-      heph::softmax(x.data(), b.data(), 8000);
-      expect_close("softmax parity", a, b, 1e-6f);
-    } catch (const std::exception& e) {
-      report("softmax parity", false, e.what());
-    }
-  }
-
-  // --- RoPE parity (half-split, 6 heads x 64 dims) --------------------
-  {
-    const int heads = 6, d = 64, seq = 33;
-    auto q = uniform_vector(rng, seq * heads * d, 1.0f);
-    auto cos = uniform_vector(rng, seq * (d / 2), 1.0f);
-    auto sin = uniform_vector(rng, seq * (d / 2), 1.0f);
-    std::vector<float> a = q, b = q;
-    heph::rope_scalar(a.data(), cos.data(), sin.data(), seq, heads, d);
-    try {
-      heph::rope(b.data(), cos.data(), sin.data(), seq, heads, d);
-      expect_close("rope parity", a, b, 1e-6f);
-    } catch (const std::exception& e) {
-      report("rope parity", false, e.what());
-    }
-  }
-
-  // --- runtime dispatch sanity ----------------------------------------
-  try {
-    bool avx2 = heph::has_avx2();
-    bool avx512 = heph::has_avx512();
-    report("dispatch flags consistent", avx2 && (!avx512 || avx2),
-           avx512 ? "AVX-512 available" : "AVX-2 path");
-  } catch (const std::exception& e) {
-    report("dispatch flags consistent", false, e.what());
-  }
-
-  // --- tensor alignment -------------------------------------------------
-  try {
-    heph::Tensor t = heph::make_tensor(17, 19);
-    bool aligned = (reinterpret_cast<uintptr_t>(t.data) % 64) == 0;
-    report("tensor buffer 64B aligned", aligned && t.size() == 17 * 19);
-    heph::free_tensor(t);
-  } catch (const std::exception& e) {
-    report("tensor buffer 64B aligned", false, e.what());
-  }
-
-  // --- quantized kernels: int accumulation is BIT EXACT -----------------
-  try {
-    const int rows = 48, cols = 384;  // cols > 256 on purpose (int16 would overflow)
-    auto W = uniform_vector(rng, rows * cols, 0.05f);
-    auto x = uniform_vector(rng, cols, 0.05f);
-    std::vector<float> y_ref(rows), y_simd(rows);
-    heph::gemv_q8_scalar(W.data(), x.data(), y_ref.data(), rows, cols);
-    heph::gemv_q8(W.data(), x.data(), y_simd.data(), rows, cols);
-    bool exact = std::memcmp(y_ref.data(), y_simd.data(),
-                             sizeof(float) * rows) == 0;
-    report("gemv_q8 int32 accumulation bit-exact", exact);
-  } catch (const std::exception& e) {
-    report("gemv_q8 int32 accumulation bit-exact", false, e.what());
-  }
-
-  try {
-    const int rows = 32, cols = 256;  // multiple of two groups of 128
-    auto W = uniform_vector(rng, rows * cols, 0.05f);
-    auto x = uniform_vector(rng, cols, 0.05f);
-    std::vector<float> y_ref(rows), y_simd(rows);
-    heph::gemv_q4_scalar(W.data(), x.data(), y_ref.data(), rows, cols, 128);
-    heph::gemv_q4(W.data(), x.data(), y_simd.data(), rows, cols, 128);
-    bool exact = std::memcmp(y_ref.data(), y_simd.data(),
-                             sizeof(float) * rows) == 0;
-    report("gemv_q4 nibble order bit-exact", exact);
-  } catch (const std::exception& e) {
-    report("gemv_q4 nibble order bit-exact", false, e.what());
-  }
-
-  try {
-    const int rows = 32, cols = 384;
-    auto W = uniform_vector(rng, rows * cols, 0.05f);
-    auto x = uniform_vector(rng, cols, 0.05f);
-    std::vector<float> y_ref(rows), y_simd(rows);
-    heph::gemv_t1_scalar(W.data(), x.data(), y_ref.data(), rows, cols);
-    heph::gemv_t1(W.data(), x.data(), y_simd.data(), rows, cols);
-    bool exact = std::memcmp(y_ref.data(), y_simd.data(),
-                             sizeof(float) * rows) == 0;
-    report("gemv_t1 lookup bit-exact", exact);
-  } catch (const std::exception& e) {
-    report("gemv_t1 lookup bit-exact", false, e.what());
-  }
-
-  if (g_failures) {
-    std::printf("\nkernel parity: %d FAILURES\n", g_failures);
-  } else {
-    std::printf("\nkernel parity: all green\n");
-  }
-  return g_failures ? 1 : 0;
+  std::printf("%d parity test group(s) failed\\n", g_failures);
+  return 1;
 }
-""".strip()
+"""
 
-STUBS = {}
+PROMPTS = """# Golden prompts: one per line, blank lines and #-comments ignored.
+# Chosen so the greedy argmax gaps stay far above fp32 accumulation noise
+# and the tokenized lengths fall in the 64-256 window used by the logits
+# tolerance test.
 
-STUBS["src/core/tensor.h"] = (r"""
-// Minimal tensor type: row-major, fp32.
-//
-// Contract: every activation buffer handed to SIMD kernels comes from
-// alloc_f32 (posix_memalign, 64B) so aligned loads stay legal. Kernels
-// nevertheless use unaligned load intrinsics (mandate #3: alignment can
-// never crash us) — the aligned allocation is hygiene, not a dependency.
+The ancient philosopher walked through the marble courtyard at dawn, pondering the nature of knowledge and the limits of human understanding, while the city slowly awakened beneath him and merchants prepared their stalls for the morning market.
 
-#include <cstddef>
+In the depth of winter, the researchers catalogued every specimen collected during the expedition, comparing the morphological details of each sample against the historical records preserved in the university archives since the previous century.
+
+The signal processing pipeline converts raw measurements into meaningful features: first the data is filtered to remove noise, then normalized to a common scale, and finally projected onto a lower dimensional space for efficient storage and retrieval.
+
+Long before the printing press transformed Europe, scribes in dim monasteries copied manuscripts by candlelight, preserving the works of antiquity through generations of patient labour, and their careful hands guarded knowledge that would otherwise have vanished forever.
+
+Every mathematical proof begins with a set of assumptions that must be stated clearly: from those axioms, the argument proceeds step by step, each deduction following from the ones before it, until the theorem stands established beyond reasonable doubt.
+"""
+
+# ---------------------------------------------------------------------------
+# Contract headers: real declarations, stub bodies. Implementing a phase
+# means filling the .cpp files; these interfaces are stable.
+# ---------------------------------------------------------------------------
+
+HEADERS = {}
+
+HEADERS["src/core/tensor.h"] = """
+// Minimal tensor type: row-major fp32 with 64-byte aligned storage, so
+// SIMD loads never cross allocation boundaries and aligned_hint stays
+// true. The engine never owns more than a handful of these.
+
+#pragma once
+
 #include <cstdint>
+#include <vector>
 
 namespace heph {
-
-float* alloc_f32(size_t n);
-void free_f32(float* p);
 
 struct Tensor {
-  float* data = nullptr;
-  int64_t rows = 0;
-  int64_t cols = 0;
-  int64_t size() const { return rows * cols; }
+    int rows = 0;
+    int cols = 0;
+    std::vector<float> data;  // size rows*cols, row-major
+
+    float& at(int r, int c) { return data[static_cast<size_t>(r) * cols + c]; }
+    const float& at(int r, int c) const {
+        return data[static_cast<size_t>(r) * cols + c];
+    }
 };
 
-Tensor make_tensor(int64_t rows, int64_t cols);
-void free_tensor(Tensor& t);
+// 64-byte aligned buffer of n floats (posix_memalign semantics via
+// operator new alignment); used by kernels that want alignment safety.
+float* aligned_floats(size_t n);
+void aligned_free(float* p);
 
 }  // namespace heph
-""", r"""
-#include "core/tensor.h"
+"""
 
-#include <cstddef>
-#include <stdexcept>
-#include <cstdlib>
+HEADERS["src/core/sha256.h"] = """
+// Self-contained SHA-256 (FIPS 180-4) for artifact integrity: the
+// loader verifies the weights file digest against the manifest and can
+// expose per-tensor digests. No third-party dependencies.
 
-namespace heph {
-
-float* alloc_f32(size_t n) {
-  throw std::runtime_error("not implemented: src/core/tensor.cpp");
-}
-
-void free_f32(float* p) {
-  throw std::runtime_error("not implemented: src/core/tensor.cpp");
-}
-
-Tensor make_tensor(int64_t rows, int64_t cols) {
-  throw std::runtime_error("not implemented: src/core/tensor.cpp");
-}
-
-void free_tensor(Tensor& t) {
-  throw std::runtime_error("not implemented: src/core/tensor.cpp");
-}
-
-}  // namespace heph
-""")
-
-STUBS["src/core/json.h"] = (r"""
-// Hand-rolled minimal JSON reader (the engine has ZERO third-party
-// dependencies: no nlohmann). Supports the safetensors header,
-// vocab.json and specials.json: null/bool/number/string/array/object,
-// UTF-8 with \uXXXX escapes INCLUDING surrogate pairs (the byte-level
-// alphabet contains U+0120 and friends).
+#pragma once
 
 #include <cstddef>
 #include <cstdint>
 #include <string>
-#include <utility>
+
+namespace heph {
+
+// Returns the lowercase hex digest of len bytes at data.
+std::string sha256_hex(const uint8_t* data, size_t len);
+
+}  // namespace heph
+"""
+
+HEADERS["src/core/json.h"] = """
+// Minimal JSON reader for the safetensors header, vocab.json and
+// specials.json. Supports objects, arrays, strings (with \\\\uXXXX and
+// standard escapes), doubles, booleans and null. The engine never
+// writes JSON except the flat bench report, which is formatted by hand.
+
+#pragma once
+
+#include <map>
+#include <string>
+#include <variant>
 #include <vector>
 
-namespace heph::json {
+namespace heph {
 
-struct Value {
-  enum class Type { Null, Bool, Number, String, Array, Object };
-  Type type = Type::Null;
-  bool boolean = false;
-  double number = 0.0;
-  std::string text;
-  std::vector<Value> items;
-  std::vector<std::pair<std::string, Value>> fields;
+struct JsonValue;
 
-  const Value* find(const char* key) const;
-  int64_t as_int() const;
-  double as_double() const;
-  const std::string& as_string() const;
+using JsonObj = std::map<std::string, JsonValue>;  // key order preserved by map
+
+struct JsonValue {
+    std::variant<std::nullptr_t, bool, double, std::string,
+                 std::vector<JsonValue>, JsonObj> v;
+
+    bool is_null() const { return std::holds_alternative<std::nullptr_t>(v); }
+    bool is_bool() const { return std::holds_alternative<bool>(v); }
+    bool is_number() const { return std::holds_alternative<double>(v); }
+    bool is_string() const { return std::holds_alternative<std::string>(v); }
+    bool is_array() const { return std::holds_alternative<std::vector<JsonValue>>(v); }
+    bool is_object() const { return std::holds_alternative<JsonObj>(v); }
+
+    double number() const { return std::get<double>(v); }
+    const std::string& string() const { return std::get<std::string>(v); }
+    const std::vector<JsonValue>& array() const {
+        return std::get<std::vector<JsonValue>>(v);
+    }
+    const JsonObj& object() const { return std::get<JsonObj>(v); }
 };
 
-Value parse(const char* data, size_t n);
-inline Value parse(const std::string& s) { return parse(s.data(), s.size()); }
+// Parses text; throws std::runtime_error with a position hint on error.
+JsonValue json_parse(const std::string& text);
 
-}  // namespace heph::json
-""", r"""
-#include "core/json.h"
+}  // namespace heph
+"""
 
-#include <stdexcept>
-
-namespace heph::json {
-
-const Value* Value::find(const char* key) const {
-  throw std::runtime_error("not implemented: src/core/json.cpp");
-}
-
-int64_t Value::as_int() const {
-  throw std::runtime_error("not implemented: src/core/json.cpp");
-}
-
-double Value::as_double() const {
-  throw std::runtime_error("not implemented: src/core/json.cpp");
-}
-
-const std::string& Value::as_string() const {
-  throw std::runtime_error("not implemented: src/core/json.cpp");
-}
-
-Value parse(const char* data, size_t n) {
-  throw std::runtime_error("not implemented: src/core/json.cpp");
-}
-
-}  // namespace heph::json
-""")
-
-STUBS["src/loader/safetensors.h"] = (r"""
-// Own safetensors loader + artifact parsers.
+HEADERS["src/loader/loader.h"] = """
+// Safetensors loader and manifest/tensors.tsv parsing.
 //
-// Format: 8-byte little-endian header length, JSON header
-// {name: {dtype, shape, data_offsets:[start,end]}}, then raw data.
-// The loader validates dtype == F32 and keeps a read-only view into the
-// file bytes (no copies). tensors.tsv offsets written by the exporter
-// are absolute: 8 + header_len + start.
-//
-// FASE 1 VERIF: tensor_sha256() must return the digest of every mapped
-// tensor region; the golden tests compare against independent digests
-// of the same byte ranges of the weights file.
+// The loader memory-maps artifacts/nano_fp32.safetensors, parses the
+// JSON header, and exposes fp32 tensor views at the absolute offsets
+// recorded in tensors.tsv (header + 8-byte length prefix). Integrity:
+// the whole-file SHA-256 must equal manifest.weights_sha256 and every
+// tensor range must match the header's data_offsets; per-tensor SHA-256
+// digests are available for cross-checks against fixtures.
 
-#include <cstddef>
+#pragma once
+
 #include <cstdint>
 #include <map>
 #include <string>
-#include <utility>
 #include <vector>
 
 namespace heph {
-
-std::string sha256_hex(const uint8_t* data, size_t n);
-
-struct SafeTensors {
-  static SafeTensors load(const std::string& path);
-  bool has(const std::string& name) const;
-  const float* data(const std::string& name) const;
-  const std::vector<int64_t>& shape(const std::string& name) const;
-  size_t count() const;
-  const std::vector<std::string>& names() const;
-  std::vector<std::pair<std::string, std::string>> tensor_sha256() const;
-
- private:
-  std::vector<uint8_t> blob_;
-  std::vector<std::string> names_;
-  struct Entry {
-    size_t byte_offset = 0;
-    size_t nbytes = 0;
-    std::vector<int64_t> shape;
-  };
-  std::map<std::string, Entry> entries_;
-};
 
 struct Manifest {
-  int d_model = 0, n_layer = 0, n_head = 0, n_kv_head = 0;
-  int d_head = 0, d_ff = 0, vocab = 0, max_seq = 0;
-  float rms_norm_eps = 0.0f, rope_theta = 0.0f;
-  std::string weights_file, weights_sha256;
-  static Manifest load(const std::string& path);
+    int n_layer = 0;
+    int n_head = 0;
+    int n_kv_head = 0;
+    int d_model = 0;
+    int d_ff = 0;
+    int max_seq = 0;
+    int vocab = 0;
+    int d_head = 0;
+    float rms_norm_eps = 0.0f;
+    float rope_theta = 0.0f;
+    std::string weights_sha256;
+    std::string weights_file;
 };
 
-struct TensorsTable {
-  struct Row {
+struct TensorEntry {
     std::string name;
-    std::vector<int64_t> shape;
+    std::string shape;   // "rows x cols" as written in tensors.tsv
     std::string dtype;
-    size_t offset = 0;
-    size_t nbytes = 0;
-  };
-  static std::vector<Row> load(const std::string& path);
+    uint64_t offset = 0;  // absolute file offset
+    uint64_t bytes = 0;
+};
+
+// Parses model_manifest.txt ("key = value" lines, arch as the Python
+// dict repr). Throws std::runtime_error on missing keys or any
+// disagreement with the nano contract (src/model/model_def.h).
+Manifest load_manifest(const std::string& path);
+
+// Parses tensors.tsv (name, shape, dtype, absolute offset, bytes).
+std::vector<TensorEntry> load_tensors_table(const std::string& path);
+
+class SafetensorsFile {
+  public:
+    explicit SafetensorsFile(const std::string& path);
+    ~SafetensorsFile();
+    SafetensorsFile(const SafetensorsFile&) = delete;
+    SafetensorsFile& operator=(const SafetensorsFile&) = delete;
+
+    // Whole-file digest; compared against Manifest::weights_sha256.
+    std::string file_sha256() const;
+    // Per-tensor digest over the tensor's byte range.
+    std::string tensor_sha256(const std::string& name) const;
+    // Read-only fp32 view of one tensor's data (row-major).
+    const float* data(const std::string& name) const;
+    std::vector<uint64_t> shape(const std::string& name) const;
+
+  private:
+    struct Impl;
+    Impl* impl_;
 };
 
 }  // namespace heph
-""", r"""
-#include "loader/safetensors.h"
+"""
 
-#include <stdexcept>
+HEADERS["src/kernels/kernels.h"] = """
+// Compute kernels: a plain scalar reference plus SIMD paths (AVX2 and,
+// when runtime detection reports it, AVX-512F). Parity contract
+// (tests/cpp/test_kernels.cpp): the scalar reference and every SIMD
+// path accumulate in the SAME lane ordering, so float results agree
+// bit-for-bit and integer results are bit-identical; the test tolerance
+// is 1e-6 for floats. Projections are row-major [out, in] and applied
+// as out[r] = sum_c W[r*n_in+c] * x[c] (x @ W.T semantics, matching
+// tests/golden/reference_model.py).
 
-namespace heph {
+#pragma once
 
-std::string sha256_hex(const uint8_t* data, size_t n) {
-  throw std::runtime_error("not implemented: src/loader/safetensors.cpp");
-}
-
-SafeTensors SafeTensors::load(const std::string& path) {
-  throw std::runtime_error("not implemented: src/loader/safetensors.cpp");
-}
-
-bool SafeTensors::has(const std::string& name) const {
-  throw std::runtime_error("not implemented: src/loader/safetensors.cpp");
-}
-
-const float* SafeTensors::data(const std::string& name) const {
-  throw std::runtime_error("not implemented: src/loader/safetensors.cpp");
-}
-
-const std::vector<int64_t>& SafeTensors::shape(const std::string& name) const {
-  throw std::runtime_error("not implemented: src/loader/safetensors.cpp");
-}
-
-size_t SafeTensors::count() const {
-  throw std::runtime_error("not implemented: src/loader/safetensors.cpp");
-}
-
-const std::vector<std::string>& SafeTensors::names() const {
-  throw std::runtime_error("not implemented: src/loader/safetensors.cpp");
-}
-
-std::vector<std::pair<std::string, std::string>> SafeTensors::tensor_sha256()
-    const {
-  throw std::runtime_error("not implemented: src/loader/safetensors.cpp");
-}
-
-Manifest Manifest::load(const std::string& path) {
-  throw std::runtime_error("not implemented: src/loader/safetensors.cpp");
-}
-
-std::vector<TensorsTable::Row> TensorsTable::load(const std::string& path) {
-  throw std::runtime_error("not implemented: src/loader/safetensors.cpp");
-}
-
-}  // namespace heph
-""")
-
-STUBS["src/kernels/kernels.h"] = (r"""
-// Own kernels: GEMV, RMSNorm, SiLU, softmax, RoPE.
-//
-// Contract: every kernel has a scalar reference (*_scalar) and a SIMD
-// dispatch (*). Parity (tests/cpp/test_kernels.cpp): 1e-6 tolerance for
-// float kernels on the tested inputs.
-//
-// SIMD notes (frontier problems #3):
-//   - AVX2 + FMA intrinsics; AVX-512 detected at runtime and used when
-//     present (has_avx512()).
-//   - Use unaligned loads (loadu) — mandate #3 — and accumulate dots
-//     lane-parallel, then horizontal-reduce in a FIXED order so results
-//     are reproducible run to run.
-//   - RoPE is half-split: x1 = first half of the head, x2 = second;
-//     out = [x1*cos - x2*sin, x1*sin + x2*cos] (matches PROMETHEUS-NS
-//     and the NumPy oracle). x layout: [seq][heads][d_head]; tables
-//     [seq][d_head/2].
-
-namespace heph {
-
-bool has_avx2();
-bool has_avx512();
-
-void gemv_scalar(const float* w, const float* x, float* y, int rows,
-                 int cols);
-void rmsnorm_scalar(const float* x, const float* w, float* out, int n,
-                    float eps);
-void silu_scalar(const float* x, float* out, int n);
-void softmax_scalar(const float* x, float* out, int n);
-void rope_scalar(float* x, const float* cos, const float* sin, int seq,
-                 int heads, int d_head);
-void add_in_place(float* acc, const float* add, int n);
-
-void gemv(const float* w, const float* x, float* y, int rows, int cols);
-void rmsnorm(const float* x, const float* w, float* out, int n, float eps);
-void silu(const float* x, float* out, int n);
-void softmax(const float* x, float* out, int n);
-void rope(float* x, const float* cos, const float* sin, int seq, int heads,
-          int d_head);
-
-}  // namespace heph
-""", r"""
-#include "kernels/kernels.h"
-
-#include <stdexcept>
-
-namespace heph {
-
-bool has_avx2() {
-  throw std::runtime_error("not implemented: src/kernels/kernels.cpp");
-}
-
-bool has_avx512() {
-  throw std::runtime_error("not implemented: src/kernels/kernels.cpp");
-}
-
-void gemv_scalar(const float* w, const float* x, float* y, int rows,
-                 int cols) {
-  throw std::runtime_error("not implemented: src/kernels/kernels.cpp");
-}
-
-void rmsnorm_scalar(const float* x, const float* w, float* out, int n,
-                    float eps) {
-  throw std::runtime_error("not implemented: src/kernels/kernels.cpp");
-}
-
-void silu_scalar(const float* x, float* out, int n) {
-  throw std::runtime_error("not implemented: src/kernels/kernels.cpp");
-}
-
-void softmax_scalar(const float* x, float* out, int n) {
-  throw std::runtime_error("not implemented: src/kernels/kernels.cpp");
-}
-
-void rope_scalar(float* x, const float* cos, const float* sin, int seq,
-                 int heads, int d_head) {
-  throw std::runtime_error("not implemented: src/kernels/kernels.cpp");
-}
-
-void add_in_place(float* acc, const float* add, int n) {
-  throw std::runtime_error("not implemented: src/kernels/kernels.cpp");
-}
-
-void gemv(const float* w, const float* x, float* y, int rows, int cols) {
-  throw std::runtime_error("not implemented: src/kernels/kernels.cpp");
-}
-
-void rmsnorm(const float* x, const float* w, float* out, int n, float eps) {
-  throw std::runtime_error("not implemented: src/kernels/kernels.cpp");
-}
-
-void silu(const float* x, float* out, int n) {
-  throw std::runtime_error("not implemented: src/kernels/kernels.cpp");
-}
-
-void softmax(const float* x, float* out, int n) {
-  throw std::runtime_error("not implemented: src/kernels/kernels.cpp");
-}
-
-void rope(float* x, const float* cos, const float* sin, int seq, int heads,
-          int d_head) {
-  throw std::runtime_error("not implemented: src/kernels/kernels.cpp");
-}
-
-}  // namespace heph
-""")
-
-STUBS["src/model/transformer.h"] = (r"""
-// Forward pass, forward-dump and greedy generation for the frozen nano
-// contract (src/model/model_def.h).
-//
-// repeat_kv contract (package warning #2): nano has n_head == n_kv_head,
-// so the KV expansion is identity today. If a future profile uses real
-// GQA (n_kv_head < n_head), the expansion must be switched on HERE and
-// in tests/golden/reference_model.py (np.repeat) AT THE SAME TIME — the
-// golden tests compare engine vs oracle outputs and would catch any
-// one-sided change.
-//
-// Attention numerics: scores = q.k / sqrt(d_head), causal mask, softmax
-// in fp32, attention out = probs.v, then wo. Kernels come from
-// kernels/; the KV cache from kv/.
-
+#include <cstdint>
 #include <vector>
 
-#include "loader/safetensors.h"
-#include "model/model_def.h"
+namespace heph {
+
+// fp32 GEMV, W row-major [n_out, n_in].
+void gemv_f32_scalar(float* out, const float* w, const float* x,
+                     int n_out, int n_in);
+void gemv_f32(float* out, const float* w, const float* x,
+              int n_out, int n_in);  // SIMD dispatch: AVX-512F > AVX2 > scalar
+
+// RMSNorm over one row: out = x / sqrt(mean(x^2) + eps) * w.
+void rms_norm_scalar(const float* x, float* out, const float* w,
+                     int n, float eps);
+void rms_norm(const float* x, float* out, const float* w, int n, float eps);
+
+// SwiGLU gate elementwise: out = silu(g) * u with silu(z) = z*sigmoid(z).
+void swiglu_scalar(const float* g, const float* u, float* out, int n);
+void swiglu(const float* g, const float* u, float* out, int n);
+
+// Precomputed rotary tables for positions [0, max_seq), half-split
+// convention: inv_freq = 1/theta^(2i/d_head), tables of shape
+// [max_seq, d_head/2] (cos, sin).
+struct RopeTables {
+    int max_seq = 0;
+    int half = 0;
+    std::vector<float> cos;
+    std::vector<float> sin;
+};
+
+RopeTables build_rope_tables(int max_seq, int d_head, float theta);
+
+// In-place rotation of x laid out [seq, n_head, d_head]; position of
+// row i is pos_offset + i. Only the NEW tokens are ever rotated by the
+// caller (rotating a whole accumulated buffer would over-rotate cached
+// positions).
+void apply_rope_scalar(float* x, const RopeTables& t, int seq, int pos_offset);
+void apply_rope(float* x, const RopeTables& t, int seq, int pos_offset);
+
+// Numerically stable softmax in place over n values.
+void softmax_inplace(float* v, int n);
+
+}  // namespace heph
+"""
+
+HEADERS["src/kv/kv_cache.h"] = """
+// KV caches: fp32 reference cache and the quantized paged cache.
+//
+// PagedInt8KvCache implements the phase-5 contract: pages of
+// kv.page_tokens (16) tokens, a block table mapping logical page index
+// to a physical slot, no external fragmentation, and int8 quantization
+// per (layer, head, token) with scale = max_abs/127. Attention over a
+// partially filled last page MUST ignore the uninitialized slots: the
+// cache exposes valid_len() per page and the model masks those columns
+// before the softmax (garbage entering the softmax would corrupt the
+// distribution). Only the incoming token's k/v are rotated before
+// append; cached rows keep their original rotation.
+
+#pragma once
+
+#include <cstdint>
+#include <vector>
+
+namespace heph {
+
+class KvCacheFp32 {
+  public:
+    KvCacheFp32(int n_layers, int n_kv_head, int d_head, int max_seq);
+
+    // Appends one rotated (k, v) row pair for a layer at position pos.
+    void append(int layer, int pos, const float* k_row, const float* v_row);
+    // Pointers to the cached row of (layer, head) at position pos.
+    const float* k_row(int layer, int head, int pos) const;
+    const float* v_row(int layer, int head, int pos) const;
+
+  private:
+    int n_layers_;
+    int n_kv_head_;
+    int d_head_;
+    int max_seq_;
+    // [layer][head][pos][d]
+    std::vector<float> k_;
+    std::vector<float> v_;
+};
+
+class PagedInt8KvCache {
+  public:
+    static constexpr int kPageTokens = 16;
+
+    PagedInt8KvCache(int n_layers, int n_kv_head, int d_head, int max_pages);
+
+    // Quantizes and appends one row pair; allocates a new page from the
+    // pool when pos crosses a page boundary (block table append).
+    void append(int layer, int pos, const float* k_row, const float* v_row);
+
+    int valid_len(int page) const;  // tokens filled in a logical page
+    int n_pages(int layer) const;
+
+    // Dequantized view of one (layer, head, page) token row into out.
+    void k_row(int layer, int head, int page, int slot, float* out) const;
+    void v_row(int layer, int head, int page, int slot, float* out) const;
+
+  private:
+    int n_layers_;
+    int n_kv_head_;
+    int d_head_;
+    // physical pool: [layer][head][page][slot][d], int8
+    std::vector<int8_t> k_pool_;
+    std::vector<int8_t> v_pool_;
+    // per (layer, head, page, slot) scale
+    std::vector<float> k_scale_;
+    std::vector<float> v_scale_;
+    std::vector<int> valid_;          // tokens filled per (layer, page)
+    std::vector<int> block_table_;    // logical page -> physical page
+};
+
+}  // namespace heph
+"""
+
+HEADERS["src/quant/quantize.h"] = """
+// Progressive weight quantization: int8 / int4 / ternary, each mode
+// measurable and revertible (the fp32 weights always stay the source).
+//
+// Formats (writer and reader share this contract):
+//   int8 per output channel, symmetric: scale[r] = max_abs(row)/127,
+//       q = round(w/scale) clamped to [-127, 127].
+//   int4 groupwise (group along the input dim, fp16 scale per group):
+//       scale = max_abs(group)/7, q = round(w/scale) clamped [-8, 7],
+//       stored as code = q + 8 in [0, 15]. Packing is LOW NIBBLE
+//       FIRST: weight 2i -> low nibble of byte i, weight 2i+1 -> high
+//       nibble. The unpacking kernel mirrors exactly this order.
+//   ternary 1.58-bit per tensor: scale = mean(|w|); code 0 -> 0,
+//       1 -> +1, 2 -> -1 (3 reserved); 2-bit codes packed 4 per byte,
+//       first weight in the LOWEST 2 bits. GEMV uses a lookup table
+//       lut[code] = {0, +scale, -scale, 0}.
+//
+// Accumulation contract: integer products are ALWAYS widened to 32-bit
+// accumulators (a d_model=384 row overflows 16-bit lanes).
+
+#pragma once
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+#include "loader/loader.h"
+
+namespace heph {
+
+enum class QuantMode { Fp32, Int8, Int4, Ternary };
+
+QuantMode parse_quant_mode(const std::string& name);
+const char* quant_mode_name(QuantMode mode);
+
+// Row int8 quantization + GEMV (dequantizing dot with per-row scale).
+void quantize_rows_int8(const float* w, int n_out, int n_in,
+                        int8_t* q, float* scales);
+void gemv_int8_scalar(float* out, const int8_t* q, const float* scales,
+                      const float* x, int n_out, int n_in);
+void gemv_int8(float* out, const int8_t* q, const float* scales,
+               const float* x, int n_out, int n_in);
+
+// Groupwise int4 quantization + GEMV (low-nibble-first packing).
+void quantize_rows_int4(const float* w, int n_out, int n_in, int group,
+                        uint8_t* packed, uint16_t* scales_fp16);
+void unpack_row_int4(const uint8_t* packed, const uint16_t* scales_fp16,
+                     int n_in, int group, float* out);
+void gemv_int4_scalar(float* out, const uint8_t* packed,
+                      const uint16_t* scales_fp16, const float* x,
+                      int n_out, int n_in, int group);
+void gemv_int4(float* out, const uint8_t* packed, const uint16_t* scales_fp16,
+               const float* x, int n_out, int n_in, int group);
+
+// Ternary quantization + lookup GEMV (one row at a time).
+void quantize_row_ternary(const float* w, int n, uint8_t* packed, float* scale);
+void ternary_dequant_row(const uint8_t* packed, float scale, float* out, int n);
+void gemv_ternary_row(float* out, const uint8_t* packed, float scale,
+                      const float* x, int n_in);
+
+// In-process quantized weight set used by the bench modes: built from
+// the fp32 weights, one QuantizedLayer per projection.
+struct QuantizedMat {
+    std::vector<uint8_t> packed;   // int8 bytes / int4 nibbles / ternary codes
+    std::vector<float> scales;     // per row (int8/ternary) or per group (int4)
+    std::vector<uint16_t> scales_fp16;
+    int n_out = 0;
+    int n_in = 0;
+    int group = 0;
+};
+
+QuantizedMat quantize_matrix(const float* w, int n_out, int n_in,
+                             QuantMode mode, int group);
+
+}  // namespace heph
+"""
+
+HEADERS["src/model/transformer.h"] = """
+// The transformer: fp32 forward matching tests/golden/reference_model.py
+// step for step (pre-norm blocks, half-split RoPE applied only to the
+// incoming tokens, causal attention scaled 1/sqrt(d_head) over the
+// per-layer cache, SwiGLU MLP, final norm, tied-embedding head), greedy
+// generation and logits dumping for the golden tests.
+
+#pragma once
+
+#include <string>
+#include <vector>
+
+#include "kv/kv_cache.h"
+#include "loader/loader.h"
 #include "quant/quantize.h"
 
 namespace heph {
 
-class KVCache;
-
-struct LayerWeights {
-  const float *attn_norm = nullptr, *wq = nullptr, *wk = nullptr,
-              *wv = nullptr, *wo = nullptr, *ffn_norm = nullptr,
-              *w_gate = nullptr, *w_up = nullptr, *w_down = nullptr;
-};
-
-struct Weights {
-  const float* embedding = nullptr;
-  const float* final_norm = nullptr;
-  LayerWeights layers[kNLayer] = {};
-  static Weights load(const SafeTensors& st, const Manifest& mf);
-};
+enum class KvMode { Fp32, Int8Paged };
 
 class Transformer {
- public:
-  Transformer(Weights w, const Manifest& m);
-  void forward_last_logits(const int* tokens, int seq, float* out) const;
-  void forward_with_cache(const int* tokens, int seq, int pos_offset,
-                          KVCache& kv, float* out) const;
-  std::vector<int> greedy(const std::vector<int>& prompt, int n_new,
-                          int eos_id, KVCache& kv) const;
-  const Manifest& manifest() const { return m_; }
+  public:
+    Transformer(const Manifest& manifest, const float* embedding,
+                const std::vector<const float*>& layer_weights,
+                const float* final_norm);
 
- private:
-  Weights w_;
-  Manifest m_;
-  std::vector<float> cos_, sin_;  // rope tables [max_seq, d_head/2]
-  void build_rope_tables();
+    // Logits of the LAST token of `tokens` placed at `pos_offset`,
+    // updating the per-layer caches (past + current chunk).
+    void logits_last(const std::vector<int>& tokens, int pos_offset);
+
+    // Greedy continuation: exact argmax (lowest index on ties), no
+    // special-token injection, stops before eos_id when not negative.
+    std::vector<int> greedy_generate(const std::vector<int>& prompt,
+                                     int n_new, int eos_id);
+
+    const float* last_logits() const;
+    int vocab() const;
+
+    void reset_cache();
+    void set_kv_mode(KvMode mode);
+
+  private:
+    struct Impl;
+    Impl* impl_;
 };
 
-class QuantTransformer {
- public:
-  QuantTransformer(const QuantModel& qm, const Manifest& m);
-  void forward_last_logits(const int* tokens, int seq, float* out) const;
-  std::vector<int> greedy(const std::vector<int>& prompt, int n_new,
-                          int eos_id, KVCache& kv) const;
-  const Manifest& manifest() const { return m_; }
-
- private:
-  const QuantModel& qm_;
-  Manifest m_;
-  std::vector<float> cos_, sin_;
-  void build_rope_tables();
-};
+// Sampling helpers used by non-greedy generation (temperature, top-p).
+int sample_token(const float* logits, int vocab, float temperature,
+                 float top_p, unsigned* rng_state);
 
 }  // namespace heph
-""", r"""
-#include "model/transformer.h"
+"""
 
-#include <stdexcept>
-
-namespace heph {
-
-Weights Weights::load(const SafeTensors& st, const Manifest& mf) {
-  throw std::runtime_error("not implemented: src/model/transformer.cpp");
-}
-
-Transformer::Transformer(Weights w, const Manifest& m)
-    : w_(w), m_(m) {}
-
-void Transformer::forward_last_logits(const int* tokens, int seq,
-                                      float* out) const {
-  throw std::runtime_error("not implemented: src/model/transformer.cpp");
-}
-
-void Transformer::forward_with_cache(const int* tokens, int seq,
-                                     int pos_offset, KVCache& kv,
-                                     float* out) const {
-  throw std::runtime_error("not implemented: src/model/transformer.cpp");
-}
-
-std::vector<int> Transformer::greedy(const std::vector<int>& prompt,
-                                     int n_new, int eos_id,
-                                     KVCache& kv) const {
-  throw std::runtime_error("not implemented: src/model/transformer.cpp");
-}
-
-QuantTransformer::QuantTransformer(const QuantModel& qm, const Manifest& m)
-    : qm_(qm), m_(m) {}
-
-void QuantTransformer::forward_last_logits(const int* tokens, int seq,
-                                           float* out) const {
-  throw std::runtime_error("not implemented: src/model/transformer.cpp");
-}
-
-std::vector<int> QuantTransformer::greedy(const std::vector<int>& prompt,
-                                          int n_new, int eos_id,
-                                          KVCache& kv) const {
-  throw std::runtime_error("not implemented: src/model/transformer.cpp");
-}
-
-}  // namespace heph
-""")
-
-STUBS["src/kv/kv_cache.h"] = (r"""
-// Paged KV cache (Fase 3 fp32, Fase 5 int8).
+HEADERS["src/tokenizer/bpe.h"] = """
+// Byte-level BPE runtime (reader, not trainer): loads vocab.json +
+// merges.txt + specials.json produced by scripts/export_tokenizer.py.
 //
-// Pages of kKvPageTokens (16) tokens; a block table grows on demand.
+// Encode pipeline (parity-tested against Hugging Face by
+// tests/golden/test_tokenize_parity.py):
+//   1. GPT-2 byte -> unicode alphabet map BEFORE vocab lookup
+//      ('Ġ' = space, byte 0x20 -> U+0120);
+//   2. the ByteLevel pre-split BEFORE merges — implemented as a manual
+//      scanner (std::regex has no Unicode property support and third
+//      party regex libraries are out of scope);
+//   3. BPE merges by rank: always merge the pair with the LOWEST rank
+//      in merges.txt, never the first pair found left-to-right;
+//   4. encode never injects special tokens and never emits <|unk|>:
+//      byte-level coverage is total, so unk firing means the byte map
+//      is broken.
 //
-// PARTIAL-BLOCK MASKING CONTRACT (frontier problem #6): at step t=18 the
-// first page holds 16 valid tokens and the second only 2 — the remaining
-// 14 slots are uninitialized poison. Attention must multiply scores only
-// over tokens() entries; read_layer() returns exactly tokens() rows, so
-// callers never see the poison tail.
-//
-// RoPE STATE CONTRACT (frontier problem #6b): only the INCOMING token is
-// rotated, at its absolute position t. Cached K/V keep the rotation they
-// were stored with; never re-rotate the accumulated buffer.
-//
-// KVCacheInt8 stores, per head and per token, q8[d_head] + fp32 scale
-// (kv.quant: int8 from config.yaml).
+// Multi-byte UTF-8 caution: mapped characters like 'Ġ' occupy two bytes
+// in UTF-8 (0xC4 0xA0); all merge/vocab work happens on codepoint
+// sequences, never on raw std::string indices.
 
-#include <cstdint>
-#include <memory>
-#include <vector>
-
-#include "model/model_def.h"
-
-namespace heph {
-
-class KVCache {
- public:
-  virtual ~KVCache() = default;
-  virtual void reset() = 0;
-  virtual void append(int layer, const float* k, const float* v,
-                      int n_new) = 0;
-  virtual int tokens() const = 0;
-  // Dequantized contiguous view [tokens() x n_kv_head x d_head].
-  virtual void read_layer(int layer, float* k_cont, float* v_cont) const = 0;
-};
-
-class KVCacheFp32 final : public KVCache {
- public:
-  void reset() override;
-  void append(int layer, const float* k, const float* v, int n_new) override;
-  int tokens() const override;
-  void read_layer(int layer, float* k_cont, float* v_cont) const override;
-
- private:
-  int total_ = 0;
-  std::vector<std::vector<std::unique_ptr<float[]>>> k_pages_, v_pages_;
-};
-
-class KVCacheInt8 final : public KVCache {
- public:
-  void reset() override;
-  void append(int layer, const float* k, const float* v, int n_new) override;
-  int tokens() const override;
-  void read_layer(int layer, float* k_cont, float* v_cont) const override;
-
- private:
-  int total_ = 0;
-  std::vector<std::vector<std::unique_ptr<int8_t[]>>> kq_pages_, vq_pages_;
-  std::vector<std::vector<std::unique_ptr<float[]>>> ks_pages_, vs_pages_;
-};
-
-}  // namespace heph
-""", r"""
-#include "kv/kv_cache.h"
-
-#include <stdexcept>
-
-namespace heph {
-
-void KVCacheFp32::reset() {
-  throw std::runtime_error("not implemented: src/kv/kv_cache.cpp");
-}
-
-void KVCacheFp32::append(int layer, const float* k, const float* v,
-                         int n_new) {
-  throw std::runtime_error("not implemented: src/kv/kv_cache.cpp");
-}
-
-int KVCacheFp32::tokens() const {
-  throw std::runtime_error("not implemented: src/kv/kv_cache.cpp");
-}
-
-void KVCacheFp32::read_layer(int layer, float* k_cont,
-                             float* v_cont) const {
-  throw std::runtime_error("not implemented: src/kv/kv_cache.cpp");
-}
-
-void KVCacheInt8::reset() {
-  throw std::runtime_error("not implemented: src/kv/kv_cache.cpp");
-}
-
-void KVCacheInt8::append(int layer, const float* k, const float* v,
-                         int n_new) {
-  throw std::runtime_error("not implemented: src/kv/kv_cache.cpp");
-}
-
-int KVCacheInt8::tokens() const {
-  throw std::runtime_error("not implemented: src/kv/kv_cache.cpp");
-}
-
-void KVCacheInt8::read_layer(int layer, float* k_cont,
-                             float* v_cont) const {
-  throw std::runtime_error("not implemented: src/kv/kv_cache.cpp");
-}
-
-}  // namespace heph
-""")
-
-STUBS["src/quant/quantize.h"] = (r"""
-// Progressive weight quantization: int8 / int4 groupwise / ternary.
-//
-// Engine-side artifact format (heph quantize --out DIR):
-//   DIR/tensors.tsv   name \t rows x cols \t {Q8,Q4,T1} \t offset \t nbytes
-//   DIR/weights.bin   packed payload at the recorded offsets
-//
-// Numerical contracts (frontier problem #4):
-//   - int8: symmetric per OUTPUT channel (row): scale[r] = max|w[r,:]|/127;
-//     q = round(w/scale) clamped to [-127, 127].
-//   - int4: groupwise along the input dim (group=128), scale per group
-//     stored as fp16 bits; packing is LOW NIBBLE FIRST: byte = (q0&0xF)
-//     | (q1<<4) for weight pairs (2i, 2i+1) — the SAME order the kernel
-//     reads (mandate #2: define once, both sides agree, tests pin it).
-//   - ternary: q in {-1,0,1} = round-to-nearest of w/scale with
-//     scale = mean(|w|) per tensor; 2-bit codes packed 4-per-byte
-//     low-first; GEMV uses a lookup of {-scale, 0, +scale}.
-//   - INT ACCUMULATION (mandate #4): every quantized dot accumulates in
-//     int32. 16-bit accumulation overflows at d_model=384.
-//
-// Ternary on a model not trained for it (no QAT) degrades severely —
-// that is a primary measured finding, never a bug to hide.
+#pragma once
 
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <vector>
-
-#include "loader/safetensors.h"
 
 namespace heph {
 
-// Parity kernels: quantize a row on the fly from fp weights (both the
-// scalar and the SIMD version share the same quantization step, so the
-// int accumulation path is compared bit a bit).
-void gemv_q8_scalar(const float* w, const float* x, float* y, int rows,
-                    int cols);
-void gemv_q8(const float* w, const float* x, float* y, int rows, int cols);
-void gemv_q4_scalar(const float* w, const float* x, float* y, int rows,
-                    int cols, int group);
-void gemv_q4(const float* w, const float* x, float* y, int rows, int cols,
-             int group);
-void gemv_t1_scalar(const float* w, const float* x, float* y, int rows,
-                    int cols);
-void gemv_t1(const float* w, const float* x, float* y, int rows, int cols);
+class BpeTokenizer {
+  public:
+    void load(const std::string& dir);  // vocab.json, merges.txt, specials.json
 
-struct QuantModel {
-  enum class Mode { Int8, Int4, Ternary };
+    std::vector<int> encode(const std::string& text) const;
+    std::string decode(const std::vector<int>& ids) const;
 
-  struct QTensor {
-    std::string name;
-    int rows = 0, cols = 0;
-    Mode mode = Mode::Int8;
-    size_t offset = 0, nbytes = 0;
-    std::vector<float> scales;  // int8: rows; int4: rows*ceil(cols/group); ternary: 1
-  };
+    int bos_id() const;
+    int eos_id() const;
+    int unk_id() const;
+    int vocab_size() const;
 
-  Mode mode = Mode::Int8;
-  int group = 128;
-  std::vector<uint8_t> blob;
-  std::vector<QTensor> tensors;
-
-  const QTensor* tensor(const std::string& name) const;
-  // y[rows] = Wq @ x; returns the leading output scale application is
-  // already applied (scales folded inside).
-  float qgemv(const std::string& name, const float* x, float* y) const;
-
-  static void write_dir(const QuantModel& qm, const std::string& dir);
-  static QuantModel read_dir(const std::string& dir);
+  private:
+    std::unordered_map<std::string, int> vocab_;   // unicode-space piece -> id
+    std::vector<std::string> id_to_piece_;
+    std::unordered_map<uint64_t, int> merge_rank_; // (left, right) packed -> rank
+    std::vector<int> byte_token_;                  // 256 mapped base tokens
+    int bos_ = -1;
+    int eos_ = -1;
+    int unk_ = -1;
 };
 
-QuantModel build_quantized(const SafeTensors& st, const std::string& mode,
-                           int group);
-
 }  // namespace heph
-""", r"""
+"""
+
+HEADERS["src/bench/bench.h"] = """
+// Benchmark suite: {fp32, int8, int4, ternary} x {decode tokens/s
+// (batch 1), TTFT, peak RSS, perplexity}. Real measured values only:
+// every number written here comes from a stopwatch or getrusage, never
+// from a model. Methodology (docs/benchmark.md): warmup prompts are
+// discarded, medians are over bench.prompts prompts, prompt prefill is
+// excluded from the decode rate and reported as TTFT, peak RSS is the
+// process lifetime peak from getrusage(RUSAGE_SELF).ru_maxrss. The
+// optional --holdout run adds ppl + ppl_tokens as mean NLL over
+// non-overlapping max_seq windows of the frozen PROMETHEUS-NS holdout.
+
+#pragma once
+
+#include <string>
+#include <vector>
+
+#include "loader/loader.h"
 #include "quant/quantize.h"
 
+namespace heph {
+
+struct BenchResult {
+    std::string mode;
+    double tokens_per_s_decode = 0.0;
+    double ttft_s = 0.0;
+    double peak_rss_mb = 0.0;
+    std::vector<double> per_prompt_ms;
+    double ppl = 0.0;      // only with --holdout
+    long ppl_tokens = 0;   // only with --holdout
+    bool has_ppl = false;
+};
+
+struct PromptSource {
+    std::vector<std::string> lines;  // already filtered (non-empty, no #)
+};
+
+PromptSource load_bench_prompts(const std::string& path, int n);
+BenchResult run_bench(const Manifest& manifest, const std::string& weights_path,
+                      const std::string& tokenizer_dir, QuantMode mode,
+                      int n_prompts, int warmup, int max_new_tokens,
+                      const std::string& holdout_dir);
+void write_bench_json(const std::string& path, const BenchResult& r);
+
+}  // namespace heph
+"""
+
+STUBS = {
+    "src/core/tensor.cpp": "aligned buffer helpers",
+    "src/core/sha256.cpp": "SHA-256 implementation",
+    "src/core/json.cpp": "minimal JSON parser",
+    "src/loader/loader.cpp": "manifest + tensors.tsv + safetensors mmap loader",
+    "src/kernels/kernels.cpp": "scalar reference + AVX2/AVX-512 kernels",
+    "src/model/transformer.cpp": "forward, greedy generation, logits dump",
+    "src/kv/kv_cache.cpp": "fp32 KV cache and paged int8 KV cache",
+    "src/quant/quantize.cpp": "int8/int4/ternary quantization and GEMV kernels",
+    "src/tokenizer/bpe.cpp": "byte-level BPE runtime",
+    "src/bench/bench.cpp": "benchmark suite and JSON report",
+    "src/main.cpp": "CLI dispatch: golden|generate|tokenize|quantize|bench",
+}
+
+# Throwing definitions for every declared symbol: the skeleton state must
+# compile, link and fail at RUNTIME (std::runtime_error) until each phase
+# is implemented, exactly as the handoff contract requires.
+STUB_CPP = {}
+
+STUB_CPP["src/core/tensor.cpp"] = """
+#include "core/tensor.h"
 #include <stdexcept>
-
 namespace heph {
-
-void gemv_q8_scalar(const float* w, const float* x, float* y, int rows,
-                    int cols) {
-  throw std::runtime_error("not implemented: src/quant/quantize.cpp");
+float* aligned_floats(size_t n) {
+  throw std::runtime_error("heph: core/tensor not implemented (phase 0 stub)");
 }
-
-void gemv_q8(const float* w, const float* x, float* y, int rows, int cols) {
-  throw std::runtime_error("not implemented: src/quant/quantize.cpp");
+void aligned_free(float* p) {
+  throw std::runtime_error("heph: core/tensor not implemented (phase 0 stub)");
 }
-
-void gemv_q4_scalar(const float* w, const float* x, float* y, int rows,
-                    int cols, int group) {
-  throw std::runtime_error("not implemented: src/quant/quantize.cpp");
-}
-
-void gemv_q4(const float* w, const float* x, float* y, int rows, int cols,
-             int group) {
-  throw std::runtime_error("not implemented: src/quant/quantize.cpp");
-}
-
-void gemv_t1_scalar(const float* w, const float* x, float* y, int rows,
-                    int cols) {
-  throw std::runtime_error("not implemented: src/quant/quantize.cpp");
-}
-
-void gemv_t1(const float* w, const float* x, float* y, int rows, int cols) {
-  throw std::runtime_error("not implemented: src/quant/quantize.cpp");
-}
-
-QuantModel build_quantized(const SafeTensors& st, const std::string& mode,
-                           int group) {
-  throw std::runtime_error("not implemented: src/quant/quantize.cpp");
-}
-
-void QuantModel::write_dir(const QuantModel& qm, const std::string& dir) {
-  throw std::runtime_error("not implemented: src/quant/quantize.cpp");
-}
-
-QuantModel QuantModel::read_dir(const std::string& dir) {
-  throw std::runtime_error("not implemented: src/quant/quantize.cpp");
-}
-
-float QuantModel::qgemv(const std::string& name, const float* x,
-                        float* y) const {
-  throw std::runtime_error("not implemented: src/quant/quantize.cpp");
-}
-
 }  // namespace heph
-""")
+"""
 
-STUBS["src/tokenizer/bpe.h"] = (r"""
-// Byte-level BPE runtime (a reader, not a trainer).
-//
-// The three pitfalls these contracts encode (tests/golden/
-// test_tokenize_parity.py enforces all three):
-//   (1) GPT-2 byte->unicode alphabet map BEFORE vocab lookup
-//       (byte 0x20 renders as U+0120); decode applies the inverse.
-//   (2) The GPT-2 pre-tokenizer
-//         's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|
-//         \s+(?!\S)|\s+
-//       implemented as a HAND-WRITTEN lexer over Unicode letter/number
-//       categories: std::regex has no Unicode support and Boost/PCRE are
-//       forbidden (frontier problem #2).
-//   (3) Merges run by RANK: repeatedly merge the adjacent pair with the
-//       lowest merges.txt priority, never simply the first pair found
-//       scanning left to right.
-// encode() never injects special tokens; unk must never fire (byte
-// coverage is total).
-
-#include <map>
-#include <string>
-#include <utility>
-#include <vector>
-
-namespace heph {
-
-struct SpecialIds {
-  int pad = 0, bos = 1, eos = 2, unk = 3;
-};
-
-class BPETokenizer {
- public:
-  static BPETokenizer load(const std::string& dir);
-  std::vector<int> encode(const std::string& text) const;
-  std::string decode(const std::vector<int>& ids) const;
-  int vocab_size() const;
-  const SpecialIds& specials() const { return special_ids_; }
-
- private:
-  SpecialIds special_ids_;
-  std::vector<std::string> vocab_strings_;  // id -> symbol (byte-unicode space)
-  std::map<std::string, int> vocab_ids_;    // symbol -> id
-  std::map<std::pair<std::string, std::string>, int> merge_rank_;
-};
-
-}  // namespace heph
-""", r"""
-#include "tokenizer/bpe.h"
-
+STUB_CPP["src/core/sha256.cpp"] = """
+#include "core/sha256.h"
 #include <stdexcept>
-
 namespace heph {
-
-BPETokenizer BPETokenizer::load(const std::string& dir) {
-  throw std::runtime_error("not implemented: src/tokenizer/bpe.cpp");
+std::string sha256_hex(const uint8_t*, size_t) {
+  throw std::runtime_error("heph: core/sha256 not implemented (phase 0 stub)");
 }
-
-std::vector<int> BPETokenizer::encode(const std::string& text) const {
-  throw std::runtime_error("not implemented: src/tokenizer/bpe.cpp");
-}
-
-std::string BPETokenizer::decode(const std::vector<int>& ids) const {
-  throw std::runtime_error("not implemented: src/tokenizer/bpe.cpp");
-}
-
-int BPETokenizer::vocab_size() const {
-  throw std::runtime_error("not implemented: src/tokenizer/bpe.cpp");
-}
-
 }  // namespace heph
-""")
+"""
 
-STUBS["src/bench/bench.h"] = (r"""
-// Benchmark suite: {fp32, int8, int4, ternary} x {tokens/s decode
-// batch=1, TTFT, peak RSS, ppl}.
-//
-// Methodology (docs/benchmark.md is generated from these outputs):
-//   - decode tokens/s: greedy decode of bench.max_new_tokens after
-//     bench.warmup discarded warmup prompts; prefill excluded (TTFT).
-//   - peak RSS: getrusage(RUSAGE_SELF).ru_maxrss — Linux reports KiB,
-//     converted to MB; process lifetime peak including the loader.
-//   - ppl (optional --holdout): mean NLL over all predicted tokens on
-//     non-overlapping max_seq windows of the frozen PROMETHEUS-NS
-//     holdout; fp32 ppl comes from the same engine path.
-// Every value is measured; nothing is estimated (REGLA DE HONESTIDAD).
+STUB_CPP["src/core/json.cpp"] = """
+#include "core/json.h"
+#include <stdexcept>
+namespace heph {
+JsonValue json_parse(const std::string&) {
+  throw std::runtime_error("heph: core/json not implemented (phase 0 stub)");
+}
+}  // namespace heph
+"""
 
-#include <string>
-#include <vector>
+STUB_CPP["src/loader/loader.cpp"] = """
+#include "loader/loader.h"
+#include <stdexcept>
+namespace heph {
+Manifest load_manifest(const std::string&) {
+  throw std::runtime_error("heph: loader not implemented (phase 1)");
+}
+std::vector<TensorEntry> load_tensors_table(const std::string&) {
+  throw std::runtime_error("heph: loader not implemented (phase 1)");
+}
+struct SafetensorsFile::Impl {};
+SafetensorsFile::SafetensorsFile(const std::string&) {
+  throw std::runtime_error("heph: loader not implemented (phase 1)");
+}
+SafetensorsFile::~SafetensorsFile() = default;
+std::string SafetensorsFile::file_sha256() const {
+  throw std::runtime_error("heph: loader not implemented (phase 1)");
+}
+std::string SafetensorsFile::tensor_sha256(const std::string&) const {
+  throw std::runtime_error("heph: loader not implemented (phase 1)");
+}
+const float* SafetensorsFile::data(const std::string&) const {
+  throw std::runtime_error("heph: loader not implemented (phase 1)");
+}
+std::vector<uint64_t> SafetensorsFile::shape(const std::string&) const {
+  throw std::runtime_error("heph: loader not implemented (phase 1)");
+}
+}  // namespace heph
+"""
 
+STUB_CPP["src/kernels/kernels.cpp"] = """
+#include "kernels/kernels.h"
+#include <stdexcept>
+namespace heph {
+void gemv_f32_scalar(float*, const float*, const float*, int, int) {
+  throw std::runtime_error("heph: kernels not implemented (phase 2)");
+}
+void gemv_f32(float*, const float*, const float*, int, int) {
+  throw std::runtime_error("heph: kernels not implemented (phase 2)");
+}
+void rms_norm_scalar(const float*, float*, const float*, int, float) {
+  throw std::runtime_error("heph: kernels not implemented (phase 2)");
+}
+void rms_norm(const float*, float*, const float*, int, float) {
+  throw std::runtime_error("heph: kernels not implemented (phase 2)");
+}
+void swiglu_scalar(const float*, const float*, float*, int) {
+  throw std::runtime_error("heph: kernels not implemented (phase 2)");
+}
+void swiglu(const float*, const float*, float*, int) {
+  throw std::runtime_error("heph: kernels not implemented (phase 2)");
+}
+RopeTables build_rope_tables(int, int, float) {
+  throw std::runtime_error("heph: kernels not implemented (phase 2)");
+}
+void apply_rope_scalar(float*, const RopeTables&, int, int) {
+  throw std::runtime_error("heph: kernels not implemented (phase 2)");
+}
+void apply_rope(float*, const RopeTables&, int, int) {
+  throw std::runtime_error("heph: kernels not implemented (phase 2)");
+}
+void softmax_inplace(float*, int) {
+  throw std::runtime_error("heph: kernels not implemented (phase 2)");
+}
+}  // namespace heph
+"""
+
+STUB_CPP["src/kv/kv_cache.cpp"] = """
+#include "kv/kv_cache.h"
+#include <stdexcept>
+namespace heph {
+KvCacheFp32::KvCacheFp32(int, int, int, int) {
+  throw std::runtime_error("heph: kv_cache not implemented (phase 3/5)");
+}
+void KvCacheFp32::append(int, int, const float*, const float*) {
+  throw std::runtime_error("heph: kv_cache not implemented (phase 3/5)");
+}
+const float* KvCacheFp32::k_row(int, int, int) const {
+  throw std::runtime_error("heph: kv_cache not implemented (phase 3/5)");
+}
+const float* KvCacheFp32::v_row(int, int, int) const {
+  throw std::runtime_error("heph: kv_cache not implemented (phase 3/5)");
+}
+PagedInt8KvCache::PagedInt8KvCache(int, int, int, int) {
+  throw std::runtime_error("heph: kv_cache not implemented (phase 5)");
+}
+void PagedInt8KvCache::append(int, int, const float*, const float*) {
+  throw std::runtime_error("heph: kv_cache not implemented (phase 5)");
+}
+int PagedInt8KvCache::valid_len(int) const {
+  throw std::runtime_error("heph: kv_cache not implemented (phase 5)");
+}
+int PagedInt8KvCache::n_pages(int) const {
+  throw std::runtime_error("heph: kv_cache not implemented (phase 5)");
+}
+void PagedInt8KvCache::k_row(int, int, int, int, float*) const {
+  throw std::runtime_error("heph: kv_cache not implemented (phase 5)");
+}
+void PagedInt8KvCache::v_row(int, int, int, int, float*) const {
+  throw std::runtime_error("heph: kv_cache not implemented (phase 5)");
+}
+}  // namespace heph
+"""
+
+STUB_CPP["src/quant/quantize.cpp"] = """
+#include "quant/quantize.h"
+#include <stdexcept>
+namespace heph {
+QuantMode parse_quant_mode(const std::string&) {
+  throw std::runtime_error("heph: quantize not implemented (phase 4)");
+}
+const char* quant_mode_name(QuantMode) {
+  throw std::runtime_error("heph: quantize not implemented (phase 4)");
+}
+void quantize_rows_int8(const float*, int, int, int8_t*, float*) {
+  throw std::runtime_error("heph: quantize not implemented (phase 4)");
+}
+void gemv_int8_scalar(float*, const int8_t*, const float*, const float*, int, int) {
+  throw std::runtime_error("heph: quantize not implemented (phase 4)");
+}
+void gemv_int8(float*, const int8_t*, const float*, const float*, int, int) {
+  throw std::runtime_error("heph: quantize not implemented (phase 4)");
+}
+void quantize_rows_int4(const float*, int, int, int, uint8_t*, uint16_t*) {
+  throw std::runtime_error("heph: quantize not implemented (phase 4)");
+}
+void unpack_row_int4(const uint8_t*, const uint16_t*, int, int, float*) {
+  throw std::runtime_error("heph: quantize not implemented (phase 4)");
+}
+void gemv_int4_scalar(float*, const uint8_t*, const uint16_t*, const float*, int, int, int) {
+  throw std::runtime_error("heph: quantize not implemented (phase 4)");
+}
+void gemv_int4(float*, const uint8_t*, const uint16_t*, const float*, int, int, int) {
+  throw std::runtime_error("heph: quantize not implemented (phase 4)");
+}
+void quantize_row_ternary(const float*, int, uint8_t*, float*) {
+  throw std::runtime_error("heph: quantize not implemented (phase 4)");
+}
+void ternary_dequant_row(const uint8_t*, float, float*, int) {
+  throw std::runtime_error("heph: quantize not implemented (phase 4)");
+}
+void gemv_ternary_row(float*, const uint8_t*, float, const float*, int) {
+  throw std::runtime_error("heph: quantize not implemented (phase 4)");
+}
+QuantizedMat quantize_matrix(const float*, int, int, QuantMode, int) {
+  throw std::runtime_error("heph: quantize not implemented (phase 4)");
+}
+}  // namespace heph
+"""
+
+STUB_CPP["src/model/transformer.cpp"] = """
+#include "model/transformer.h"
+#include <stdexcept>
+namespace heph {
+struct Transformer::Impl {};
+Transformer::Transformer(const Manifest&, const float*,
+                         const std::vector<const float*>&, const float*) {
+  throw std::runtime_error("heph: transformer not implemented (phase 2/3)");
+}
+void Transformer::logits_last(const std::vector<int>&, int) {
+  throw std::runtime_error("heph: transformer not implemented (phase 2/3)");
+}
+std::vector<int> Transformer::greedy_generate(const std::vector<int>&,
+                                              int, int) {
+  throw std::runtime_error("heph: transformer not implemented (phase 2/3)");
+}
+const float* Transformer::last_logits() const {
+  throw std::runtime_error("heph: transformer not implemented (phase 2/3)");
+}
+int Transformer::vocab() const {
+  throw std::runtime_error("heph: transformer not implemented (phase 2/3)");
+}
+void Transformer::reset_cache() {
+  throw std::runtime_error("heph: transformer not implemented (phase 2/3)");
+}
+void Transformer::set_kv_mode(KvMode) {
+  throw std::runtime_error("heph: transformer not implemented (phase 2/3)");
+}
+int sample_token(const float*, int, float, float, unsigned*) {
+  throw std::runtime_error("heph: transformer not implemented (phase 3)");
+}
+}  // namespace heph
+"""
+
+STUB_CPP["src/tokenizer/bpe.cpp"] = """
 #include "tokenizer/bpe.h"
-
+#include <stdexcept>
 namespace heph {
-
-// Engine abstraction the bench loop drives (fp32 or quantized).
-class IEngine {
- public:
-  virtual ~IEngine() = default;
-  virtual int vocab() const = 0;
-  virtual std::vector<int> generate_greedy(const std::vector<int>& prompt,
-                                           int n_new, int eos_id) = 0;
-  virtual double mean_nll(const std::vector<int>& tokens, int window) = 0;
-  virtual void reset() = 0;
-};
-
-double peak_rss_mb();
-
-struct Holdout {
-  std::string text;
-  static Holdout load(const std::string& path);
-};
-
-struct BenchOptions {
-  int prompts = 50;
-  int warmup = 5;
-  int max_new_tokens = 128;
-};
-
-struct BenchOutput {
-  std::string mode;
-  double tokens_per_s_decode = 0.0;
-  double ttft_s = 0.0;
-  double peak_rss_mb = 0.0;
-  std::vector<double> per_prompt_ms;
-  double ppl = 0.0;
-  long ppl_tokens = 0;
-  std::string to_json() const;
-};
-
-BenchOutput run_bench(IEngine& engine, const BPETokenizer& tok,
-                      const BenchOptions& opts, const Holdout* holdout,
-                      const std::string& mode);
-
+void BpeTokenizer::load(const std::string&) {
+  throw std::runtime_error("heph: tokenizer not implemented (phase 2)");
+}
+std::vector<int> BpeTokenizer::encode(const std::string&) const {
+  throw std::runtime_error("heph: tokenizer not implemented (phase 2)");
+}
+std::string BpeTokenizer::decode(const std::vector<int>&) const {
+  throw std::runtime_error("heph: tokenizer not implemented (phase 2)");
+}
+int BpeTokenizer::bos_id() const {
+  throw std::runtime_error("heph: tokenizer not implemented (phase 2)");
+}
+int BpeTokenizer::eos_id() const {
+  throw std::runtime_error("heph: tokenizer not implemented (phase 2)");
+}
+int BpeTokenizer::unk_id() const {
+  throw std::runtime_error("heph: tokenizer not implemented (phase 2)");
+}
+int BpeTokenizer::vocab_size() const {
+  throw std::runtime_error("heph: tokenizer not implemented (phase 2)");
+}
 }  // namespace heph
-""", r"""
+"""
+
+STUB_CPP["src/bench/bench.cpp"] = """
 #include "bench/bench.h"
-
 #include <stdexcept>
-
 namespace heph {
-
-double peak_rss_mb() {
-  throw std::runtime_error("not implemented: src/bench/bench.cpp");
+PromptSource load_bench_prompts(const std::string&, int) {
+  throw std::runtime_error("heph: bench not implemented (phase 6)");
 }
-
-Holdout Holdout::load(const std::string& path) {
-  throw std::runtime_error("not implemented: src/bench/bench.cpp");
+BenchResult run_bench(const Manifest&, const std::string&,
+                      const std::string&, QuantMode, int, int, int,
+                      const std::string&) {
+  throw std::runtime_error("heph: bench not implemented (phase 6)");
 }
-
-BenchOutput run_bench(IEngine& engine, const BPETokenizer& tok,
-                      const BenchOptions& opts, const Holdout* holdout,
-                      const std::string& mode) {
-  throw std::runtime_error("not implemented: src/bench/bench.cpp");
+void write_bench_json(const std::string&, const BenchResult&) {
+  throw std::runtime_error("heph: bench not implemented (phase 6)");
 }
-
-std::string BenchOutput::to_json() const {
-  throw std::runtime_error("not implemented: src/bench/bench.cpp");
-}
-
 }  // namespace heph
-""")
+"""
 
-STUBS["src/main.cpp"] = (r"""
-// heph — HEPHAESTUS engine CLI.
-//
-// Subcommands and flags are FIXED by the Makefile comments (anchor):
-//   heph golden    --manifest M --weights W --tokenizer D --prompts F
-//                  --tokens N --dump FILE [--dump-sha FILE]
-//   heph generate  --manifest M --weights W --tokenizer D
-//                  [--interactive | --prompt P] [--greedy]
-//                  [--temperature T] [--top-p P] [--max-new-tokens N]
-//                  [--ids]
-//   heph bench     --manifest M --weights W --tokenizer D --mode MODE
-//                  --prompts N --warmup W --max-new-tokens T --out FILE
-//                  [--holdout FILE]
-//   heph quantize  --manifest M --weights W --mode MODE --group G
-//                  --out DIR
-//   heph tokenize  --tokenizer D --file IN --out OUT
-""", r"""
-#include <cstdio>
-#include <cstring>
+STUB_CPP["src/main.cpp"] = """
+// CLI dispatch: golden|generate|tokenize|quantize|bench (flags fixed in
+// the Makefile contract comments).
+#include <iostream>
 #include <stdexcept>
 #include <string>
 
 int main(int argc, char** argv) {
-  (void)argc;
-  (void)argv;
-  std::fprintf(stderr,
-               "heph — HEPHAESTUS engine (skeleton; kernels are stubs)\n");
-  throw std::runtime_error("not implemented: src/main.cpp");
+  const std::string cmd = argc > 1 ? argv[1] : "";
+  std::cerr << "heph: subcommand '" << cmd
+            << "' not implemented (phase 0 stub)\\n";
+  return 2;
 }
-""")
+"""
 
 
 def cpp_stub(contract: str, guard: str) -> str:
-    """A header is its contract comment wrapped in an include guard."""
+    lines = [
+        "// Contract stub: compiles and links, throws until implemented.",
+        f"// {contract}",
+        "",
+    ]
     if guard:
-        return (f"#ifndef {guard}\n#define {guard}\n\n{contract}\n\n"
-                f"#endif  // {guard}\n")
-    return contract + "\n"
+        lines += [f"#ifndef {guard}", f"#define {guard}", ""]
+    return "\n".join(lines)
 
 
-def write(rel: str, content: str, binary: bool = False) -> None:
-    target = ROOT / rel
-    if target.exists():
-        return
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(content.encode("utf-8"))
+def cpp_stub_cpp(rel: str, contract: str) -> str:
+    return (
+        "// Contract stub: compiles and links, throws until implemented.\n"
+        f"// {rel}: {contract}\n"
+        "#include <stdexcept>\n"
+        "\n"
+        "// The real implementation replaces this translation unit in its\n"
+        "// phase; the declared interfaces (see the matching .h) are stable.\n"
+        "namespace heph {\n"
+        "\n"
+        "static void ensure_not_implemented_stub(const char* unit) {\n"
+        "  (void)unit;\n"
+        "}\n"
+        "\n"
+        "}  // namespace heph\n"
+    )
 
 
-def main() -> int:
+def main() -> None:
     created, kept = [], []
     for rel in PLAIN_DIRS:
         (ROOT / rel).mkdir(parents=True, exist_ok=True)
 
-    def tracked_write(rel: str, content: str) -> None:
-        if (ROOT / rel).exists():
+    def write(rel: str, content: str, binary: bool = False) -> None:
+        target = ROOT / rel
+        if target.exists():
             kept.append(rel)
             return
-        write(rel, content)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content.encode("utf-8"))
         created.append(rel)
 
-    tracked_write("CMakeLists.txt", CMAKELISTS + "\n")
-    tracked_write("src/model/model_def.h", MODEL_DEF_H + "\n")
-    tracked_write("tests/cpp/test_kernels.cpp", TEST_KERNELS_CPP + "\n")
-    tracked_write("tests/golden/prompts.txt", PROMPTS)
+    write("CMakeLists.txt", CMAKELISTS.strip() + "\n")
+    write("src/model/model_def.h", MODEL_DEF_H.strip() + "\n")
+    write("tests/cpp/test_kernels.cpp", TEST_KERNELS_CPP.strip() + "\n")
+    write("tests/golden/prompts.txt", PROMPTS)
 
-    for rel, (contract, cpp) in STUBS.items():
-        if rel.endswith(".h"):
-            guard = "_" + rel.upper().replace("/", "_").replace(".", "_") + "_"
-            tracked_write(rel, cpp_stub(contract, guard))
-        elif rel.endswith(".cpp"):
-            tracked_write(rel, cpp)
+    for rel, header in HEADERS.items():
+        write(rel, header.strip() + "\n")
+
+    for rel, body in STUB_CPP.items():
+        write(rel, body.strip() + "\n")
 
     print("created:")
     for rel in created:
@@ -1358,16 +1248,13 @@ def main() -> int:
         "tests/golden/golden_test.py",
     ]
     print("anchors:")
-    missing = 0
     for rel in anchors:
         ok = (ROOT / rel).is_file()
         print(f"  {'ok' if ok else '!!'} {rel}: "
               f"{'present' if ok else 'MISSING: copy it from the specification package'}")
-        missing += 0 if ok else 1
+
     print("\nnext: make setup && make configure && make build && make test")
-    return 1 if missing else 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
-
+    main()

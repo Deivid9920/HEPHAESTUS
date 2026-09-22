@@ -60,7 +60,6 @@ void gemv_ternary_row(float* out, const uint8_t* packed, float scale,
 // In-process quantized weight set used by the bench modes: built from
 // the fp32 weights, one QuantizedLayer per projection.
 struct QuantizedMat {
-    QuantMode mode = QuantMode::Fp32;
     std::vector<uint8_t> packed;   // int8 bytes / int4 nibbles / ternary codes
     std::vector<float> scales;     // per row (int8/ternary) or per group (int4)
     std::vector<uint16_t> scales_fp16;

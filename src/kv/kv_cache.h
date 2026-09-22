@@ -47,10 +47,7 @@ class PagedInt8KvCache {
     // pool when pos crosses a page boundary (block table append).
     void append(int layer, int pos, const float* k_row, const float* v_row);
 
-    // Tokens actually written in (layer, page): attention must never
-    // read beyond this (the partially filled last page keeps its
-    // uninitialized slots out of the softmax).
-    int valid_len(int layer, int page) const;
+    int valid_len(int page) const;  // tokens filled in a logical page
     int n_pages(int layer) const;
 
     // Dequantized view of one (layer, head, page) token row into out.
@@ -61,7 +58,6 @@ class PagedInt8KvCache {
     int n_layers_;
     int n_kv_head_;
     int d_head_;
-    int max_pages_;
     // physical pool: [layer][head][page][slot][d], int8
     std::vector<int8_t> k_pool_;
     std::vector<int8_t> v_pool_;

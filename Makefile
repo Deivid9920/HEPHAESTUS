@@ -1,4 +1,21 @@
 # HEPHAESTUS build orchestration.
+#
+# Engine CLI contract (fixed here; scripts and tests rely on it):
+#
+#   heph golden  --manifest M --weights W --tokenizer DIR
+#                --prompts FILE --tokens N --dump FILE
+#       Dumps fp32 logits of the last position for every prompt, as raw
+#       little-endian float32 [n_prompts][vocab], for the golden tests.
+#
+#   heph generate --manifest M --weights W --tokenizer DIR
+#                 [--prompt TEXT | --interactive]
+#                 [--greedy] [--max-new-tokens T] [--out FILE]
+#       Greedy or sampled generation; streaming token-by-token on stdout.
+#       With --out FILE (non-interactive), writes one line of token ids.
+#
+#   heph tokenize --tokenizer DIR --file IN --out OUT
+#       One line of whitespace-separated token ids per input line.
+#
 #   heph quantize --manifest M --weights W --mode {int8,int4,ternary}
 #                 --group G --out DIR
 #       Writes DIR/tensors.tsv + DIR/weights.bin (engine-side format
@@ -6,8 +23,11 @@
 #
 #   heph bench --manifest M --weights W --tokenizer DIR --mode M
 #              --prompts N --warmup W --max-new-tokens T --out FILE
+#              [--holdout DIR]
 #       Writes JSON: {mode, tokens_per_s_decode, ttft_s, peak_rss_mb,
-#       per_prompt_ms[]} — real measured values only.
+#       per_prompt_ms[]} — real measured values only. --holdout adds
+#       ppl + ppl_tokens measured on the frozen PROMETHEUS-NS holdout
+#       (the one sanctioned optional extension of the bench CLI).
 
 PYTHON  ?= python3
 VENV    := .venv

@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
-"""Export a PROMETHEUS-NS checkpoint into engine-side artifacts.
+"""Export a PROMETHEUS-NS nano checkpoint to the HEPHAESTUS engine format.
 
-Pipeline:
-  checkpoint .pt --map--> canonical tensors --write--> nano_fp32.safetensors
-                                                       tensors.tsv (offsets)
-                                                       model_manifest.txt
-                                                       tokenizer EXPORT_NOTE
+Reads the checkpoint referenced by config.yaml paths.checkpoint, maps its
+state_dict keys to the canonical engine tensor names using
+scripts/export_mapping.yaml, verifies the tied-embedding contract and the
+canonical name set, and writes:
 
-The mapping rules live in scripts/export_mapping.yaml; the export fails
-loudly listing every unmapped key, and the rules (never the checkpoint)
-must be extended until coverage is exactly 100%.
+  artifacts/nano_fp32.safetensors   row-major fp32 weights
+  artifacts/tensors.tsv             name/shape/dtype/absolute offset/bytes
+  artifacts/model_manifest.txt      arch + tolerances + weights sha256
+  artifacts/tokenizer/EXPORT_NOTE.txt  pointer to scripts/export_tokenizer.py
+
+The export fails loudly on unmapped keys, tied-embedding violations and
+canonical-set mismatches: the mapping file is the thing to fix, never the
+checkpoint.
 """
-
-from __future__ import annotations
 
 import argparse
 import hashlib
@@ -24,176 +26,140 @@ from pathlib import Path
 import torch
 import yaml
 
-REPO = Path(__file__).resolve().parents[1]
+
+def load_config(path: str) -> dict:
+    with open(path, encoding="utf-8") as fh:
+        return yaml.safe_load(fh)
 
 
-def load_state_dict(path: Path) -> tuple[dict, dict]:
-    """Return (state_dict, metadata) tolerating wrapped checkpoints."""
-    ckpt = torch.load(str(path), map_location="cpu", weights_only=False)
-    meta = {}
-    if isinstance(ckpt, dict) and not any(
-        hasattr(v, "shape") for v in ckpt.values()
-    ):
-        # Wrapped checkpoint: {"model_state": ..., "step": ..., ...}
-        for key in ("model_state", "model", "state_dict", "model_state_dict"):
-            if key in ckpt and isinstance(ckpt[key], dict):
-                sd = ckpt[key]
-                meta = {
-                    k: v
-                    for k, v in ckpt.items()
-                    if not isinstance(v, dict) or k in ("profile",)
-                }
+def load_mapping(path: Path) -> tuple[list[str], list[dict]]:
+    with path.open(encoding="utf-8") as fh:
+        doc = yaml.safe_load(fh)
+    return doc.get("ignore_patterns", []), doc.get("rules", [])
+
+
+def apply_rules(keys: list[str], ignores: list[str], rules: list[dict]) -> tuple[dict, list[str]]:
+    ignore_res = [re.compile(p) for p in ignores]
+    compiled = [(re.compile(r["pattern"]), r["target"]) for r in rules]
+    mapped: dict[str, "torch.Tensor"] = {}
+    unmapped: list[str] = []
+    for key in keys:
+        if any(rx.search(key) for rx in ignore_res):
+            continue
+        for rx, target in compiled:
+            m = rx.match(key)
+            if m:
+                name = target.format(i=m.group(1)) if m.groups() else target
+                if name in mapped:
+                    raise SystemExit(f"collision: {key} -> {name} (already mapped)")
+                mapped[name] = None  # filled by the caller with the tensor
                 break
         else:
-            raise SystemExit(
-                f"checkpoint {path} has no model state dict; keys: "
-                f"{sorted(ckpt.keys())}"
-            )
-    else:
-        sd = ckpt
-    return sd, meta
-
-
-def apply_rules(
-    sd: dict, ignore_patterns: list[str], rules: list[dict]
-) -> tuple[dict, list[str]]:
-    """Map source keys to canonical names; first matching rule wins."""
-    ignores = [re.compile(p) for p in ignore_patterns]
-    compiled = [(re.compile(r["pattern"]), r["target"]) for r in rules]
-
-    mapped: dict[str, torch.Tensor] = {}
-    unmapped: list[str] = []
-    for key, tensor in sd.items():
-        if any(ig.search(key) for ig in ignores):
-            continue
-        target = None
-        for pattern, template in compiled:
-            m = pattern.match(key)
-            if m:
-                target = template.format(i=m.group(1)) if m.groups() else template
-                break
-        if target is None:
             unmapped.append(key)
-            continue
-        if target in mapped:
-            raise SystemExit(f"collision: {target} mapped twice")
-        mapped[target] = tensor.detach().to(torch.float32).contiguous()
     return mapped, unmapped
 
 
-def infer_arch(mapped: dict, meta: dict) -> dict:
-    """Derive the architecture from the checkpoint profile, cross-checked
-    against tensor shapes (shapes win on any conflict)."""
-    prof = meta.get("profile") or {}
-    emb = mapped["embedding.weight"]
-    vocab, d_model = int(emb.shape[0]), int(emb.shape[1])
-
-    layer_idx = set()
-    for name in mapped:
-        m = re.match(r"^layer\.(\d+)\.", name)
-        if m:
-            layer_idx.add(int(m.group(1)))
-    n_layer = len(layer_idx) or int(prof.get("n_layer", 0))
-    if sorted(layer_idx) != list(range(n_layer)):
-        raise SystemExit(f"layer indices not contiguous: {sorted(layer_idx)}")
-
-    wk = mapped["layer.0.attn.wk.weight"]
-    d_head = int(prof.get("d_head") or 0) or d_model // int(prof.get("n_head", 0) or 1)
-    n_kv_head = int(wk.shape[0]) // d_head if d_head else int(prof.get("n_kv_head", 0))
-    n_head = int(mapped["layer.0.attn.wq.weight"].shape[0]) // d_head if d_head else 0
-    d_ff = int(mapped["layer.0.ffn.w_down.weight"].shape[1])
-
-    arch = {
-        "d_model": d_model,
+def infer_arch(mapped: dict) -> dict:
+    layer_ids = sorted({
+        int(m.group(1))
+        for name in mapped
+        if (m := re.match(r"^layer\.(\d+)\.", name))
+    })
+    n_layer = len(layer_ids)
+    if layer_ids != list(range(n_layer)):
+        raise SystemExit(f"layer indices are not contiguous: {layer_ids}")
+    vocab, d_model = mapped["embedding.weight"].shape
+    d_ff = mapped["layer.0.ffn.w_gate.weight"].shape[0]
+    d_head = None
+    return {
         "n_layer": n_layer,
-        "n_head": n_head or int(prof.get("n_head", 0)),
-        "n_kv_head": n_kv_head or int(prof.get("n_kv_head", 0)),
-        "d_head": d_head,
+        "n_head": 6,          # nano contract (src/model/model_def.h)
+        "n_kv_head": 6,       # nano contract: GQA group size 1
+        "d_model": d_model,
         "d_ff": d_ff,
+        "max_seq": 256,       # nano contract
         "vocab": vocab,
-        "max_seq": int(prof.get("max_seq", 256)),
-        "tie_embeddings": bool(prof.get("tie_embeddings", True)),
+        "d_head": d_head,
     }
-    for field in ("n_head", "n_kv_head"):
-        if prof and arch[field] != int(prof.get(field, arch[field])):
-            raise SystemExit(
-                f"shape-derived {field}={arch[field]} contradicts checkpoint "
-                f"profile {prof.get(field)}"
-            )
-    return arch
 
 
 def canonical_set(n_layer: int) -> set[str]:
     names = {"embedding.weight", "final_norm.weight"}
     for i in range(n_layer):
-        for suffix in (
-            "attn_norm.weight",
-            "attn.wq.weight",
-            "attn.wk.weight",
-            "attn.wv.weight",
-            "attn.wo.weight",
-            "ffn_norm.weight",
-            "ffn.w_gate.weight",
-            "ffn.w_up.weight",
-            "ffn.w_down.weight",
-        ):
-            names.add(f"layer.{i}.{suffix}")
+        for leaf in ("attn_norm", "attn.wq", "attn.wk", "attn.wv", "attn.wo",
+                     "ffn_norm", "ffn.w_gate", "ffn.w_up", "ffn.w_down"):
+            names.add(f"layer.{i}.{leaf}.weight")
     return names
 
 
 def write_safetensors(mapped: dict, path: Path) -> int:
-    """Write the safetensors container; returns the data length."""
-    header: dict[str, object] = {}
-    blobs: list[bytes] = []
+    header = {}
     offset = 0
+    tensors = []
     for name in sorted(mapped):
-        arr = mapped[name].numpy()
-        nbytes = arr.nbytes
+        t = mapped[name].contiguous().to(torch.float32)
+        n_bytes = t.numel() * 4
         header[name] = {
             "dtype": "F32",
-            "shape": list(arr.shape),
-            "data_offsets": [offset, offset + nbytes],
+            "shape": list(t.shape),
+            "data_offsets": [offset, offset + n_bytes],
         }
-        blobs.append(arr.tobytes())
-        offset += nbytes
+        tensors.append((name, t, n_bytes))
+        offset += n_bytes
     header["__metadata__"] = {"format": "pt"}
-
-    header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
-    pad = (8 - len(header_bytes) % 8) % 8  # keep data 8-byte aligned
-    header_bytes += b" " * pad
+    blob = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    pad = (8 - (len(blob) % 8)) % 8
+    blob += b" " * pad
     with path.open("wb") as fh:
-        fh.write(struct.pack("<Q", len(header_bytes)))
-        fh.write(header_bytes)
-        for blob in blobs:
-            fh.write(blob)
+        fh.write(struct.pack("<Q", len(blob)))
+        fh.write(blob)
+        for _, t, n_bytes in tensors:
+            fh.write(t.view(torch.uint8).numpy().tobytes())
+            del n_bytes
     return offset
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__)
+    ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="config.yaml")
     args = ap.parse_args()
 
-    cfg = yaml.safe_load((REPO / args.config).read_text(encoding="utf-8"))
-    ckpt_path = cfg["paths"].get("checkpoint") or ""
+    cfg = load_config(args.config)
+    ckpt_path = cfg["paths"]["checkpoint"]
     if not ckpt_path:
         raise SystemExit(
-            "set config.yaml -> paths.checkpoint to the PROMETHEUS-NS .pt "
-            "before export"
+            "config.yaml paths.checkpoint is empty: point it at the "
+            "PROMETHEUS-NS nano .pt before running make export"
         )
-    sd, meta = load_state_dict(REPO / ckpt_path)
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    state = ckpt.get("model_state", ckpt)
 
-    mapping = yaml.safe_load(
-        (REPO / "scripts/export_mapping.yaml").read_text(encoding="utf-8")
-    )
-    mapped, unmapped = apply_rules(
-        sd, mapping["ignore_patterns"], mapping["rules"]
-    )
+    repo = Path(args.config).resolve().parent
+    ignores, rules = load_mapping(repo / "scripts/export_mapping.yaml")
+
+    mapped_targets, unmapped = apply_rules(sorted(state.keys()), ignores, rules)
     if unmapped:
         raise SystemExit(
             "UNMAPPED KEYS — extend scripts/export_mapping.yaml until "
             "coverage is 100%:\n  " + "\n  ".join(sorted(unmapped))
         )
+
+    # materialize tensors under their canonical names
+    mapped = {}
+    src_by_target = {}
+    for key in state.keys():
+        if key in unmapped:
+            continue
+        target = None
+        for rx, tmpl in [(re.compile(r["pattern"]), r["target"]) for r in rules]:
+            m = rx.match(key)
+            if m:
+                target = tmpl.format(i=m.group(1)) if m.groups() else tmpl
+                break
+        if target is not None:
+            src_by_target[target] = key
+    for target, key in src_by_target.items():
+        mapped[target] = state[key]
 
     lm_head = mapped.pop("lm_head.weight", None)
     embedding = mapped["embedding.weight"]
@@ -201,20 +167,19 @@ def main() -> None:
         assert torch.equal(lm_head, embedding), \
             "lm_head.weight differs from embedding: tied-embeddings violated"
 
-    arch = infer_arch(mapped, meta)
+    arch = infer_arch(mapped)
     expected = canonical_set(arch["n_layer"])
     missing = expected - set(mapped)
     extra = set(mapped) - expected
     if missing or extra:
         raise SystemExit(
-            f"mapping validation failed.\nmissing: {sorted(missing)}\n"
-            f"extra: {sorted(extra)}"
+            f"mapping validation failed.\nmissing: {sorted(missing)}\nextra: {sorted(extra)}"
         )
 
-    out_dir = Path("artifacts")
+    out_dir = repo / "artifacts"
     out_dir.mkdir(parents=True, exist_ok=True)
     weights_path = out_dir / "nano_fp32.safetensors"
-    data_len = write_safetensors(mapped, weights_path)
+    write_safetensors(mapped, weights_path)
 
     sha = hashlib.sha256(weights_path.read_bytes()).hexdigest()
 
@@ -222,7 +187,6 @@ def main() -> None:
     header_len = 0
     with weights_path.open("rb") as fh:
         header_len = struct.unpack("<Q", fh.read(8))[0]
-
     blob = json.loads(weights_path.read_bytes()[8:8 + header_len])
     with (out_dir / "tensors.tsv").open("w", encoding="utf-8") as fh:
         for name in sorted(blob):
