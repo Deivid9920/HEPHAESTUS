@@ -4,14 +4,14 @@
 
 | Metric | fp32 | int8 | int4 | ternary |
 |---|---|---|---|---|
-| decode tokens/s (batch 1) | pending | pending | pending | pending |
-| TTFT (s) | pending | pending | pending | pending |
-| per-prompt median (ms) | pending | pending | pending | pending |
-| per-prompt p95 (ms) | pending | pending | pending | pending |
-| peak RSS (MB) | pending | pending | pending | pending |
-| perplexity | - | - | - | - |
-| ppl delta vs fp32 (%) | - | - | - | - |
-| ppl tokens (n) | - | - | - | - |
+| decode tokens/s (batch 1) | 318.9 | 523.2 | 41.9 | 124.1 |
+| TTFT (s) | 0.11 | 0.06 | 1.02 | 0.33 |
+| per-prompt median (ms) | 512.2 | 311.4 | 4083.1 | 1366.9 |
+| per-prompt p95 (ms) | 537.5 | 323.8 | 4177.4 | 1411.2 |
+| peak RSS (MB) | 70.7 | 83.7 | 77.4 | 73.9 |
+| perplexity | 3082.71 | 3083.81 | 3110.05 | 4000.61 |
+| ppl delta vs fp32 (%) | - | +0.04 | +0.89 | +29.78 |
+| ppl tokens (n) | 598 | 598 | 598 | 598 |
 
 ## Methodology
 

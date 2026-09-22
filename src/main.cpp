@@ -255,9 +255,12 @@ int cmd_quantize(const Args& a) {
     std::ostringstream tsv;
     std::vector<uint8_t> blob;
     for (const std::string& name : names) {
-        const auto shape = f.shape(name);  // [rows, cols]
-        const long rows = static_cast<long>(shape[0]);
-        const long cols = static_cast<long>(shape[1]);
+        const auto shape = f.shape(name);  // [rows, cols] (norms are 1-D)
+        const long rows =
+            shape.size() > 1 ? static_cast<long>(shape[0]) : 1;
+        const long cols = shape.size() > 1
+                              ? static_cast<long>(shape[1])
+                              : static_cast<long>(shape[0]);
         const bool is_norm = name.find("norm") != std::string::npos;
         std::string dtype;
         const size_t offset = blob.size();
