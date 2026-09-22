@@ -79,10 +79,22 @@ none may be estimated.
 
 | Metric | fp32 | int8 | int4 | ternary |
 |--------|------|------|------|---------|
-| decode tokens/s (batch 1) | pending | pending | pending | pending |
-| perplexity (PROMETHEUS holdout) | pending | pending | pending | pending |
-| peak RSS (MB) | pending | pending | pending | pending |
-| greedy match vs oracle | pending | pending | pending | pending |
+| decode tokens/s (batch 1) | 318.9 | 523.2 | 41.9 | 124.1 |
+| perplexity (PROMETHEUS holdout) | 3082.71 | 3083.81 | 3110.05 | 4000.61 |
+| ppl delta vs fp32 | - | +0.04% | +0.89% | +29.78% |
+| peak RSS (MB) | 70.7 | 83.7 | 77.4 | 73.9 |
+| greedy match vs oracle | exact | n/a | n/a | n/a |
+
+Measured on the reference container (2 vCPU, AVX-512 available,
+`-O3 -march=native`); 50 prompts, warmup 5, 128 greedy new tokens,
+perplexity over the frozen PROMETHEUS-NS holdout (598 predicted tokens,
+non-overlapping 256-token windows). Full methodology and JSON sources in
+`docs/benchmark.md` and `docs/bench_*.json`. int8 is the only mode faster
+than fp32 here: the int4/ternary kernels keep one sequential code path
+for the bit-exactness contract, so their GEMVs are extraction-bound —
+a measured, honest result, not a regression to hide. The ternary
+perplexity delta (+29.8%) matches the spec's warning that a model not
+trained for BitNet degrades severely under 1.58-bit PTQ.
 
 ## Limits (honest)
 
