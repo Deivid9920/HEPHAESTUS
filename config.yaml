@@ -9,7 +9,7 @@ paths:
   tensors_table:  "artifacts/tensors.tsv"
   weights:        "artifacts/nano_fp32.safetensors"
   tokenizer_dir:  "artifacts/tokenizer"    # vocab.json + merges.txt
-  checkpoint:     ""                       # path to PROMETHEUS-NS .pt (set before export)
+  checkpoint:     "/home/z/my-project/prometheus-ns/artifacts/checkpoints/latest.pt"
 
 arch_defaults:
   rms_norm_eps: 1.0e-5

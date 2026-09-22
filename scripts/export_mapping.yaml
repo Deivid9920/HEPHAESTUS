@@ -30,3 +30,16 @@ rules:
   - {pattern: "^layers?\\.(\\d+)\\.(ffn|mlp)\\.(w_down|down_proj)\\.weight$", target: "layer.{i}.ffn.w_down.weight"}
   - {pattern: "^(final_norm|norm)\\.weight$",                             target: "final_norm.weight"}
   - {pattern: "^lm_head\\.weight$",                                       target: "lm_head.weight"}  # tied: verified equal to embedding, not exported
+  # --- PROMETHEUS-NS actual state_dict names (added after running the
+  # --- export against a real nano checkpoint: blocks.N.*, tok_emb, norm_f)
+  - {pattern: "^tok_emb\\.weight$",                          target: "embedding.weight"}
+  - {pattern: "^blocks\\.(\\d+)\\.norm_attn\\.weight$",      target: "layer.{i}.attn_norm.weight"}
+  - {pattern: "^blocks\\.(\\d+)\\.attn\\.wq\\.weight$",      target: "layer.{i}.attn.wq.weight"}
+  - {pattern: "^blocks\\.(\\d+)\\.attn\\.wk\\.weight$",      target: "layer.{i}.attn.wk.weight"}
+  - {pattern: "^blocks\\.(\\d+)\\.attn\\.wv\\.weight$",      target: "layer.{i}.attn.wv.weight"}
+  - {pattern: "^blocks\\.(\\d+)\\.attn\\.wo\\.weight$",      target: "layer.{i}.attn.wo.weight"}
+  - {pattern: "^blocks\\.(\\d+)\\.norm_ffn\\.weight$",       target: "layer.{i}.ffn_norm.weight"}
+  - {pattern: "^blocks\\.(\\d+)\\.ffn\\.w_gate\\.weight$",   target: "layer.{i}.ffn.w_gate.weight"}
+  - {pattern: "^blocks\\.(\\d+)\\.ffn\\.w_up\\.weight$",     target: "layer.{i}.ffn.w_up.weight"}
+  - {pattern: "^blocks\\.(\\d+)\\.ffn\\.w_down\\.weight$",   target: "layer.{i}.ffn.w_down.weight"}
+  - {pattern: "^norm_f\\.weight$",                           target: "final_norm.weight"}
